@@ -59,3 +59,8 @@ Flags:
 - Out-of-band *created* resources (needs `import {}` block + HCL codegen)
 - Nested block / nested attribute drift (only top-level attrs today)
 - PR creation (planned — open a branch + PR instead of local diff)
+
+## License
+
+[Apache License 2.0](LICENSE). Permissive, with an explicit patent grant —
+suitable for adoption inside companies' infrastructure pipelines.
