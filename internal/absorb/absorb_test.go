@@ -311,3 +311,188 @@ func TestSetAttrMapEntry(t *testing.T) {
 		t.Errorf("db entry was lost:\n%s", got)
 	}
 }
+
+// ---- Nested block tests ------------------------------------------------
+
+// TestNestedBlockSingleton: one nested block, attr drifted.
+func TestNestedBlockSingleton(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  instance_type = "t3.micro"
+
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp2"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"constant_value":"t3.micro"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"instance_type": "t3.micro",
+			"root_block_device": []interface{}{
+				map[string]interface{}{"volume_size": float64(20), "volume_type": "gp2"},
+			},
+		},
+		After: map[string]interface{}{
+			"instance_type": "t3.micro",
+			"root_block_device": []interface{}{
+				map[string]interface{}{"volume_size": float64(50), "volume_type": "gp2"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if !strings.Contains(got, "volume_size = 50") {
+		t.Errorf("nested block attr not absorbed:\n%s", got)
+	}
+	// Sibling attr unchanged.
+	if !strings.Contains(got, `volume_type = "gp2"`) {
+		t.Errorf("sibling attr lost:\n%s", got)
+	}
+}
+
+// TestNestedBlockMultiInstanceMatchByStableAttr: two ebs_block_device blocks;
+// only the one matching device_name="/dev/sda1" should be edited.
+func TestNestedBlockMultiInstanceMatchByStableAttr(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  ebs_block_device {
+    device_name = "/dev/sda1"
+    volume_size = 20
+  }
+
+  ebs_block_device {
+    device_name = "/dev/sdb1"
+    volume_size = 100
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"ebs_block_device": []interface{}{
+				map[string]interface{}{"device_name": "/dev/sda1", "volume_size": float64(20)},
+				map[string]interface{}{"device_name": "/dev/sdb1", "volume_size": float64(100)},
+			},
+		},
+		After: map[string]interface{}{
+			"ebs_block_device": []interface{}{
+				map[string]interface{}{"device_name": "/dev/sda1", "volume_size": float64(50)}, // drifted
+				map[string]interface{}{"device_name": "/dev/sdb1", "volume_size": float64(100)},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	// sda1 block must be updated.
+	if !strings.Contains(got, "volume_size = 50") {
+		t.Errorf("sda1 block not absorbed:\n%s", got)
+	}
+	// sdb1 block must be untouched.
+	if !strings.Contains(got, "volume_size = 100") {
+		t.Errorf("sdb1 sibling block was modified:\n%s", got)
+	}
+}
+
+// TestNestedBlockVarRefUnresolved: nested block attr is a var ref — must be
+// reported as unresolved, never hardcoded.
+func TestNestedBlockVarRefUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `variable "vol_size" {}
+
+resource "aws_instance" "web" {
+  root_block_device {
+    volume_size = var.vol_size
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}}},
+		After:  map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(50)}}},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (var ref), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "variable reference") {
+		t.Fatalf("want variable-reference unresolved, got %v", unresolved)
+	}
+}
+
+// TestNestedBlockCountChangeUnresolved: block count changed (add/remove) —
+// must be reported, never silently skipped.
+func TestNestedBlockCountChangeUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_security_group" "sg" {
+  ingress {
+    from_port = 80
+    to_port   = 80
+    protocol  = "tcp"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_security_group.sg","mode":"managed","type":"aws_security_group","name":"sg","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
+		Before: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80)},
+			},
+		},
+		After: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80)},
+				map[string]interface{}{"from_port": float64(443), "to_port": float64(443)}, // added out-of-band
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (count change), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "count changed") {
+		t.Fatalf("want count-change unresolved, got %v", unresolved)
+	}
+}

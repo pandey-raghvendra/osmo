@@ -56,13 +56,20 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 
 	var unresolved []provenance.Unresolved
 
-	// Trace every changed attribute to an edit target.
-	type op struct {
+	// scalarOp: a top-level attr routed through provenance tracing.
+	type scalarOp struct {
 		target    *provenance.Target
 		driftAddr string
 		attr      string
 	}
-	var ops []op
+	// nestedOp: a nested-block attr drift, handled via direct HCL edit.
+	type nestedOp struct {
+		nbd  NestedBlockDrift
+		addr address.Addr
+	}
+	var scalarOps []scalarOp
+	var nestedOps []nestedOp
+
 	for _, d := range drifts {
 		addr, err := address.Parse(d.Address)
 		if err != nil {
@@ -70,13 +77,34 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 				Address: d.Address, Attr: "*", Reason: "unparseable address: " + err.Error()})
 			continue
 		}
-		for name, val := range changedAttrs(d.Before, d.After) {
-			t, u := provenance.Trace(root, addr, name, val)
-			if u != nil {
-				unresolved = append(unresolved, *u)
+		for name, av := range d.After {
+			bv := d.Before[name]
+			if reflect.DeepEqual(bv, av) {
 				continue
 			}
-			ops = append(ops, op{target: t, driftAddr: d.Address, attr: name})
+			afterSlice, isSlice := av.([]interface{})
+			beforeSlice, _ := bv.([]interface{})
+			if !isSlice {
+				// Scalar attr: route through provenance.
+				t, u := provenance.Trace(root, addr, name, av)
+				if u != nil {
+					unresolved = append(unresolved, *u)
+					continue
+				}
+				scalarOps = append(scalarOps, scalarOp{t, d.Address, name})
+			} else {
+				// Nested block: count change = add/remove (out of scope).
+				if len(beforeSlice) != len(afterSlice) {
+					unresolved = append(unresolved, provenance.Unresolved{
+						Address: d.Address, Attr: name,
+						Reason: fmt.Sprintf("nested block count changed (%d → %d); block add/remove not supported", len(beforeSlice), len(afterSlice)),
+					})
+					continue
+				}
+				for _, nbd := range diffNestedBlocks(addr, d.Address, name, beforeSlice, afterSlice) {
+					nestedOps = append(nestedOps, nestedOp{nbd, addr})
+				}
+			}
 		}
 	}
 
@@ -95,20 +123,29 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		editsByPath[path][driftAddr][attr] = true
 	}
 
-	for _, o := range ops {
+	getEditor := func(dir string) (*dirEditor, error) {
+		de := editors[dir]
+		if de != nil {
+			return de, nil
+		}
+		de, err := newDirEditor(dir)
+		if err != nil {
+			return nil, err
+		}
+		editors[dir] = de
+		return de, nil
+	}
+
+	for _, o := range scalarOps {
 		dir, err := resolveDir(root, baseDir, o.target.SourceModulePath)
 		if err != nil {
 			unresolved = append(unresolved, provenance.Unresolved{
 				Address: o.driftAddr, Attr: o.attr, Reason: err.Error()})
 			continue
 		}
-		de := editors[dir]
-		if de == nil {
-			de, err = newDirEditor(dir)
-			if err != nil {
-				return nil, nil, err
-			}
-			editors[dir] = de
+		de, err := getEditor(dir)
+		if err != nil {
+			return nil, nil, err
 		}
 		path, err := de.apply(o.target)
 		if err != nil {
@@ -117,6 +154,24 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			continue
 		}
 		record(path, o.driftAddr, o.attr)
+	}
+
+	for _, o := range nestedOps {
+		dir, err := resolveDir(root, baseDir, o.addr.Modules)
+		if err != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.nbd.DriftAddr, Attr: o.nbd.BlockType + ".*", Reason: err.Error()})
+			continue
+		}
+		de, err := getEditor(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		path, absorbed, urs := de.applyNested(o.nbd)
+		unresolved = append(unresolved, urs...)
+		for _, attr := range absorbed {
+			record(path, o.nbd.DriftAddr, attr)
+		}
 	}
 
 	// Emit one FileChange per dirty file.
@@ -152,8 +207,159 @@ func buildEdits(byAddr map[string]map[string]bool) []ResourceEdit {
 	return edits
 }
 
+// ---- Nested block support -----------------------------------------------
+
+// NestedBlockDrift holds drift detected within one nested block instance.
+type NestedBlockDrift struct {
+	ResourceType string
+	ResourceName string
+	ResourceMode string
+	DriftAddr    string
+	BlockType    string
+	Before       map[string]interface{} // all attrs of this block (for matching)
+	DriftedAttrs map[string]interface{} // only changed attrs -> new values
+}
+
+// diffNestedBlocks compares element-matched before/after arrays and returns one
+// NestedBlockDrift per element that has attribute changes. Caller guarantees
+// len(before) == len(after).
+func diffNestedBlocks(addr address.Addr, driftAddr, blockType string, before, after []interface{}) []NestedBlockDrift {
+	var drifts []NestedBlockDrift
+	for i := range after {
+		bm, _ := before[i].(map[string]interface{})
+		am, _ := after[i].(map[string]interface{})
+		if bm == nil || am == nil {
+			continue
+		}
+		changed := changedAttrs(bm, am)
+		if len(changed) == 0 {
+			continue
+		}
+		drifts = append(drifts, NestedBlockDrift{
+			ResourceType: addr.Type,
+			ResourceName: addr.Name,
+			ResourceMode: addr.Mode,
+			DriftAddr:    driftAddr,
+			BlockType:    blockType,
+			Before:       bm,
+			DriftedAttrs: changed,
+		})
+	}
+	return drifts
+}
+
+// applyNested locates the matching nested block in the dirEditor's files and
+// rewrites the drifted attributes that are present as literals. Returns the
+// file path edited, the absorbed attr names (blockType.attr form), and any
+// unresolved attrs (var refs, missing, etc.).
+func (de *dirEditor) applyNested(nbd NestedBlockDrift) (path string, absorbed []string, unresolved []provenance.Unresolved) {
+	outerType := "resource"
+	if nbd.ResourceMode == "data" {
+		outerType = "data"
+	}
+	for p, ff := range de.files {
+		resBlock := ff.f.Body().FirstMatchingBlock(outerType, []string{nbd.ResourceType, nbd.ResourceName})
+		if resBlock == nil {
+			continue
+		}
+		nested := findMatchingNestedBlock(resBlock.Body(), nbd.BlockType, nbd.Before, nbd.DriftedAttrs)
+		if nested == nil {
+			continue // resource found but nested block not here; try next file
+		}
+		body := nested.Body()
+		for attr, val := range nbd.DriftedAttrs {
+			qualAttr := nbd.BlockType + "." + attr
+			if body.GetAttribute(attr) == nil {
+				// Attr absent from config (computed/read-only) — skip silently.
+				continue
+			}
+			if _, evalErr := evalAttr(nested, attr); evalErr != nil {
+				// Attr is a variable reference, not a literal.
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: nbd.DriftAddr, Attr: qualAttr,
+					Reason: "nested block attr is a variable reference; trace through var chains not yet supported for nested blocks",
+				})
+				continue
+			}
+			newVal, ctyErr := toCty(val)
+			if ctyErr != nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: nbd.DriftAddr, Attr: qualAttr, Reason: ctyErr.Error()})
+				continue
+			}
+			body.SetAttributeValue(attr, newVal)
+			absorbed = append(absorbed, qualAttr)
+			ff.dirty = true
+		}
+		sort.Strings(absorbed)
+		return p, absorbed, unresolved
+	}
+	// Resource block not found at all.
+	return "", nil, unresolved
+}
+
+// findMatchingNestedBlock returns the nested block of blockType within body
+// whose stable (non-drifted) attributes best match the before values. For
+// singleton blocks (only one candidate) it returns immediately. For multiple
+// candidates it scores each by how many stable attrs match literal values.
+func findMatchingNestedBlock(body *hclwrite.Body, blockType string, before, drifted map[string]interface{}) *hclwrite.Block {
+	var candidates []*hclwrite.Block
+	for _, b := range body.Blocks() {
+		if b.Type() == blockType {
+			candidates = append(candidates, b)
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return nil
+	case 1:
+		return candidates[0]
+	default:
+		// Stable attrs: in before but not in drifted — use as identity signals.
+		stable := make(map[string]interface{}, len(before))
+		for k, v := range before {
+			if _, isDrifted := drifted[k]; !isDrifted {
+				stable[k] = v
+			}
+		}
+		best, bestScore := candidates[0], -1
+		for _, c := range candidates {
+			if s := blockMatchScore(c, stable); s > bestScore {
+				bestScore = s
+				best = c
+			}
+		}
+		return best
+	}
+}
+
+// blockMatchScore counts how many stable attrs have matching literal values in
+// the block. Comparison is done by marshalling both sides to JSON.
+func blockMatchScore(b *hclwrite.Block, stableAttrs map[string]interface{}) int {
+	score := 0
+	for attr, expected := range stableAttrs {
+		if b.Body().GetAttribute(attr) == nil {
+			continue
+		}
+		curCty, err := evalAttr(b, attr)
+		if err != nil {
+			continue // var ref — can't compare
+		}
+		expCty, err := toCty(expected)
+		if err != nil {
+			continue
+		}
+		curJSON, e1 := ctyjson.Marshal(curCty, curCty.Type())
+		expJSON, e2 := ctyjson.Marshal(expCty, expCty.Type())
+		if e1 == nil && e2 == nil && string(curJSON) == string(expJSON) {
+			score++
+		}
+	}
+	return score
+}
+
 // changedAttrs returns top-level attributes whose value differs between before
-// and after. Nested-block drift is out of scope for v1.
+// and after (used both for top-level scalar drift and within diffNestedBlocks).
 func changedAttrs(before, after map[string]interface{}) map[string]interface{} {
 	changed := map[string]interface{}{}
 	for k, av := range after {
