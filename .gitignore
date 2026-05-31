@@ -12,3 +12,9 @@ internal/e2e/testdata/fixture/.terraform/
 internal/e2e/testdata/fixture/.terraform.lock.hcl
 internal/e2e/testdata/fixture/*.tfstate*
 internal/e2e/testdata/fixture/tf.plan
+
+# localstack fixture terraform artifacts
+internal/e2e/testdata/localstack/.terraform/
+internal/e2e/testdata/localstack/.terraform.lock.hcl
+internal/e2e/testdata/localstack/*.tfstate*
+internal/e2e/testdata/localstack/tf.plan
