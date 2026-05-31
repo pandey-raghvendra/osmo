@@ -207,7 +207,8 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		record(path, o.driftAddr, o.attr)
 	}
 
-	// Nested attr ops: always edit in the resource's own source directory.
+	// Nested attr ops: attempt literal edit in the resource's own dir; fall back
+	// to provenance redirect if the attr is a var ref.
 	for _, o := range nestedAttrOps {
 		dir, err := resolveDir(root, baseDir, o.addr.Modules)
 		if err != nil {
@@ -222,9 +223,34 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		if err != nil {
 			return nil, nil, err
 		}
-		path, qualAttr, u := de.applyBlockAttrEdit(o.edit)
+		path, qualAttr, redirect, u := de.applyBlockAttrEdit(o.edit, root)
 		if u != nil {
 			unresolved = append(unresolved, *u)
+			continue
+		}
+		if redirect != nil {
+			// Var ref traced to a different (parent) location — apply there.
+			redirectDir, dirErr := resolveDir(root, baseDir, redirect.SourceModulePath)
+			if dirErr != nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: o.edit.DriftAddr, Attr: qualAttr, Reason: dirErr.Error(),
+				})
+				continue
+			}
+			rde, deErr := getEditor(redirectDir)
+			if deErr != nil {
+				return nil, nil, deErr
+			}
+			rpath, applyErr := rde.apply(redirect)
+			if applyErr != nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: o.edit.DriftAddr, Attr: qualAttr, Reason: applyErr.Error(),
+				})
+				continue
+			}
+			if rpath != "" {
+				record(rpath, o.edit.DriftAddr, qualAttr)
+			}
 			continue
 		}
 		if path != "" {
@@ -572,9 +598,14 @@ func toMapSlice(slice []interface{}) []map[string]interface{} {
 }
 
 // applyBlockAttrEdit navigates to the nested block described by edit.Steps and
-// rewrites the attribute. Returns the file path edited, the qualified attr
-// name, and an Unresolved if the attr is a var ref or absent.
-func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit) (path, qualAttr string, u *provenance.Unresolved) {
+// rewrites the attribute. When the attribute is a variable reference rather than
+// a literal, it calls provenance.TraceNested (using the configuration tree in
+// root) and returns a redirect Target for Plan() to apply via the right dirEditor.
+//
+// Returns (path, qualAttr, redirect, unresolved):
+//   - redirect non-nil: caller must apply the Target (may be in a different dir).
+//   - u non-nil: attribute could not be absorbed.
+func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module) (path, qualAttr string, redirect *provenance.Target, u *provenance.Unresolved) {
 	outerType := "resource"
 	if edit.ResMode == "data" {
 		outerType = "data"
@@ -593,26 +624,40 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit) (path, qualAttr stri
 		}
 		if targetBody.GetAttribute(edit.Attr) == nil {
 			// Computed / not in config: skip silently (same rule as top-level).
-			return p, qualAttr, nil
+			return p, qualAttr, nil, nil
 		}
 		if _, evalErr := evalBodyAttr(targetBody, edit.Attr); evalErr != nil {
-			return p, qualAttr, &provenance.Unresolved{
-				Address: edit.DriftAddr,
-				Attr:    qualAttr,
-				Reason:  "nested block attr is a variable reference; var-chain tracing inside nested blocks not yet supported",
+			// Attribute is a variable reference — try to trace via config tree.
+			if root != nil {
+				addr, parseErr := address.Parse(edit.DriftAddr)
+				if parseErr == nil {
+					blockPath := make([]string, len(edit.Steps))
+					for i, s := range edit.Steps {
+						blockPath[i] = s.BlockType
+					}
+					tgt, tu := provenance.TraceNested(root, addr, blockPath, edit.Attr, edit.Value)
+					if tu != nil {
+						return p, qualAttr, nil, tu
+					}
+					return p, qualAttr, tgt, nil
+				}
+			}
+			return p, qualAttr, nil, &provenance.Unresolved{
+				Address: edit.DriftAddr, Attr: qualAttr,
+				Reason: "nested block attr is a variable reference; cannot parse drift address for tracing",
 			}
 		}
 		newVal, ctyErr := toCty(edit.Value)
 		if ctyErr != nil {
-			return p, qualAttr, &provenance.Unresolved{
+			return p, qualAttr, nil, &provenance.Unresolved{
 				Address: edit.DriftAddr, Attr: qualAttr, Reason: ctyErr.Error(),
 			}
 		}
 		targetBody.SetAttributeValue(edit.Attr, newVal)
 		ff.dirty = true
-		return p, qualAttr, nil
+		return p, qualAttr, nil, nil
 	}
-	return "", qualAttr, nil
+	return "", qualAttr, nil, nil
 }
 
 // applyBlockStructChange adds and removes nested blocks in the parent body

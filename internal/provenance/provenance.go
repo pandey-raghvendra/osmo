@@ -170,6 +170,51 @@ func resolveVar(root *config.Module, addr address.Addr, depth int, varName, attr
 	return resolveVar(root, addr, depth-1, ref, attr, value, instanced, instKey)
 }
 
+// TraceNested resolves a drifted attribute inside a nested block to an edit
+// Target by reading the block's expression from the configuration tree and
+// following the same var-chain logic as Trace.
+//
+// blockPath is the ordered slice of block type names from the resource body to
+// the block that contains attr (e.g., ["ebs_block_device"] or
+// ["server_side_encryption_configuration","rule","apply_server_side_encryption_by_default"]).
+func TraceNested(root *config.Module, addr address.Addr, blockPath []string, attr string, value interface{}) (*Target, *Unresolved) {
+	qualAttr := qualNestedAttr(blockPath, attr)
+	depth := len(addr.Modules)
+
+	containing, err := navigate(root, addr.Modules)
+	if err != nil {
+		return nil, unresolved(addr, qualAttr, err.Error())
+	}
+	res := containing.FindResource(addr.RelAddr())
+	if res == nil {
+		return nil, unresolved(addr, qualAttr, "resource not found in configuration")
+	}
+	expr := res.FindNestedExpression(blockPath, attr)
+	if expr == nil {
+		return nil, unresolved(addr, qualAttr, "nested block expression not found in configuration tree")
+	}
+	if expr.HasConstant {
+		// Constant in config tree but evalBodyAttr failed — shouldn't normally
+		// happen. Avoid double-edit by reporting unresolvable.
+		return nil, unresolved(addr, qualAttr,
+			"nested block attr is a constant in config tree but could not be evaluated (expression may be complex)")
+	}
+	ref, uerr := singleVarRef(expr.References)
+	if uerr != "" {
+		return nil, unresolved(addr, qualAttr, uerr)
+	}
+	instanced, instKey := instancing(addr)
+	return resolveVar(root, addr, depth, ref, qualAttr, value, instanced, instKey)
+}
+
+// qualNestedAttr builds a dotted attribute name like "block.subblock.attr".
+func qualNestedAttr(path []string, attr string) string {
+	if len(path) == 0 {
+		return attr
+	}
+	return strings.Join(path, ".") + "." + attr
+}
+
 // navigate walks from root down the module path and returns the innermost
 // module reached.
 func navigate(root *config.Module, steps []address.Step) (*config.Module, error) {

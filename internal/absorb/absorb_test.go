@@ -422,8 +422,9 @@ func TestNestedBlockMultiInstanceMatchByStableAttr(t *testing.T) {
 	}
 }
 
-// TestNestedBlockVarRefUnresolved: nested block attr is a var ref — must be
-// reported as unresolved, never hardcoded.
+// TestNestedBlockVarRefUnresolved: nested block attr is a var ref but the config
+// expressions tree has no entry for the block (empty expressions: {}).
+// The attr cannot be traced → reported as unresolved, never hardcoded.
 func TestNestedBlockVarRefUnresolved(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.tf", `variable "vol_size" {}
@@ -434,6 +435,7 @@ resource "aws_instance" "web" {
   }
 }
 `)
+	// expressions:{} — no nested block expression present in the config tree.
 	cfg := `{"configuration":{"root_module":{
 		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
 	}}}`
@@ -448,10 +450,85 @@ resource "aws_instance" "web" {
 		t.Fatal(err)
 	}
 	if len(changes) != 0 {
-		t.Fatalf("want 0 changes (var ref), got %d", len(changes))
+		t.Fatalf("want 0 changes (var ref, no config expression), got %d", len(changes))
 	}
-	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "variable reference") {
-		t.Fatalf("want variable-reference unresolved, got %v", unresolved)
+	// TraceNested fails because the nested block expression is absent from the
+	// config tree — expect exactly one unresolved entry.
+	if len(unresolved) != 1 {
+		t.Fatalf("want 1 unresolved (expression not found), got %v", unresolved)
+	}
+}
+
+// TestNestedBlockVarRefTraced: nested block attr is var.vol_size that resolves
+// through a module argument. The edit must land on the root module call arg,
+// not the nested block itself.
+func TestNestedBlockVarRefTraced(t *testing.T) {
+	dir := t.TempDir()
+	// Root passes vol_size = 20 to module "app".
+	writeFile(t, dir, "main.tf", `module "app" {
+  source   = "./modules/app"
+  vol_size = 20
+}
+`)
+	// Module resource uses var.vol_size inside a nested block.
+	writeFile(t, dir, "modules/app/main.tf", `variable "vol_size" {}
+
+resource "aws_instance" "web" {
+  root_block_device {
+    volume_size = var.vol_size
+  }
+}
+`)
+	// Plan JSON: nested block expression shows references = ["var.vol_size"].
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"app":{
+			"source":"./modules/app",
+			"expressions":{"vol_size":{"constant_value":20}},
+			"module":{
+				"variables":{"vol_size":{}},
+				"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+					"expressions":{
+						"root_block_device":[{"volume_size":{"references":["var.vol_size"]}}]
+					}}]
+			}
+		}}
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "module.app.aws_instance.web",
+		Type:    "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"root_block_device": []interface{}{
+				map[string]interface{}{"volume_size": float64(20)},
+			},
+		},
+		After: map[string]interface{}{
+			"root_block_device": []interface{}{
+				map[string]interface{}{"volume_size": float64(50)},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change (root module call), got %d", len(changes))
+	}
+	// Edit must land on ROOT main.tf (module call arg), not the module source.
+	if strings.Contains(changes[0].Path, "modules") {
+		t.Errorf("edited module source instead of root call arg: %s", changes[0].Path)
+	}
+	if !strings.Contains(string(changes[0].After), "vol_size = 50") {
+		t.Errorf("module call arg not absorbed:\n%s", changes[0].After)
+	}
+	// Module source must be untouched.
+	src, _ := os.ReadFile(filepath.Join(dir, "modules/app/main.tf"))
+	if !strings.Contains(string(src), "volume_size = var.vol_size") {
+		t.Errorf("module source was modified:\n%s", src)
 	}
 }
 

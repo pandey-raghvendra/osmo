@@ -34,6 +34,105 @@ type Resource struct {
 	Type        string                `json:"type"`
 	Name        string                `json:"name"`
 	Expressions map[string]Expression `json:"expressions"`
+	rawExprJSON json.RawMessage       // set in UnmarshalJSON; used by FindNestedExpression
+}
+
+// UnmarshalJSON decodes a Resource, capturing the raw expressions JSON so that
+// nested block expressions (arrays of sub-expression objects) can be navigated
+// later via FindNestedExpression — they decode to zero Expression otherwise.
+func (r *Resource) UnmarshalJSON(b []byte) error {
+	type Alias struct {
+		Address     string                `json:"address"`
+		Mode        string                `json:"mode"`
+		Type        string                `json:"type"`
+		Name        string                `json:"name"`
+		Expressions map[string]Expression `json:"expressions"`
+	}
+	var a Alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	r.Address = a.Address
+	r.Mode = a.Mode
+	r.Type = a.Type
+	r.Name = a.Name
+	r.Expressions = a.Expressions
+	// Also stash the raw expressions blob for nested lookups.
+	var raw struct {
+		Expressions json.RawMessage `json:"expressions"`
+	}
+	_ = json.Unmarshal(b, &raw) // best-effort; ignore error
+	r.rawExprJSON = raw.Expressions
+	return nil
+}
+
+// FindNestedExpression navigates the raw expressions JSON along a block-type
+// path and returns the Expression for attr at the leaf. path is the sequence
+// of block type names from the resource body to the containing block
+// (e.g., ["ebs_block_device"] for ebs_block_device.volume_size).
+//
+// When a block type has multiple array elements (multiple block instances with
+// different expressions), the element whose attr has references is preferred
+// over one with constant_value — because this method is called specifically when
+// a variable reference was detected in the live HCL.
+func (r *Resource) FindNestedExpression(path []string, attr string) *Expression {
+	if len(r.rawExprJSON) == 0 || len(path) == 0 {
+		return nil
+	}
+	cur := r.rawExprJSON
+	for i, blockType := range path {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(cur, &obj); err != nil {
+			return nil
+		}
+		arrRaw, ok := obj[blockType]
+		if !ok {
+			return nil
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(arrRaw, &arr); err != nil {
+			return nil
+		}
+		if len(arr) == 0 {
+			return nil
+		}
+		if i == len(path)-1 {
+			// Leaf step: scan all block instances for attr, prefer var ref.
+			return findExprInBlockArray(arr, attr)
+		}
+		// Intermediate step: take the first element and keep descending.
+		cur = arr[0]
+	}
+	return nil
+}
+
+// findExprInBlockArray scans an array of sub-expression objects for the first
+// element whose attr is defined, preferring elements with References over
+// constant_value.
+func findExprInBlockArray(arr []json.RawMessage, attr string) *Expression {
+	var fallback *Expression
+	for _, elem := range arr {
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(elem, &obj); err != nil {
+			continue
+		}
+		exprRaw, ok := obj[attr]
+		if !ok {
+			continue
+		}
+		var expr Expression
+		if err := json.Unmarshal(exprRaw, &expr); err != nil {
+			continue
+		}
+		if len(expr.References) > 0 {
+			return &expr // prefer var ref — caller wants this
+		}
+		if fallback == nil {
+			tmp := expr
+			fallback = &tmp
+		}
+	}
+	return fallback
 }
 
 // ModuleCall is a `module "x" {}` block. Expressions are the arguments passed
