@@ -11,6 +11,69 @@ import (
 	"github.com/raghav/osmo/internal/tfplan"
 )
 
+// ---- Safety guard tests --------------------------------------------------
+
+// TestSensitiveAttrSkipped: drift attr marked sensitive must never be written
+// to plain-text config.
+func TestSensitiveAttrSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_db_instance" "db" {
+  password = "old-password"
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_db_instance.db","mode":"managed","type":"aws_db_instance","name":"db",
+			"expressions":{"password":{"constant_value":"old-password"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_db_instance.db", Type: "aws_db_instance", Name: "db",
+		Before:         map[string]interface{}{"password": "old-password"},
+		After:          map[string]interface{}{"password": "new-password"},
+		AfterSensitive: map[string]interface{}{"password": true},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (sensitive attr), got %d:\n%s", len(changes), changes[0].After)
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "sensitive") {
+		t.Fatalf("want 1 sensitive unresolved, got %v", unresolved)
+	}
+}
+
+// TestNullAfterValueSkipped: drift attr with null after-value must be reported
+// as unresolved rather than setting the attr to null or crashing.
+func TestNullAfterValueSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  instance_type = "t3.micro"
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"constant_value":"t3.micro"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{"instance_type": "t3.micro"},
+		After:  map[string]interface{}{"instance_type": nil}, // null = removed in reality
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (null after value), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "null") {
+		t.Fatalf("want 1 null-value unresolved, got %v", unresolved)
+	}
+}
+
 // writeFile writes content to dir/name, creating parent dirs.
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
@@ -719,4 +782,144 @@ func TestDeepNestedBlock(t *testing.T) {
 		t.Errorf("mid-level bucket_key_enabled not absorbed:\n%s", got)
 	}
 	// kms_master_key_id was not in config → skipped silently (computed).
+}
+
+// ---- Dynamic block tests ------------------------------------------------
+
+// TestDynamicBlockCollectionUpdate: resource uses `dynamic "ingress"` driven by
+// var.rules; a new ingress block appears in drift. The edit must update the
+// root module call arg (rules = [...]) to include the new block, not append a
+// literal ingress {} block to the HCL.
+func TestDynamicBlockCollectionUpdate(t *testing.T) {
+	dir := t.TempDir()
+	// Root passes rules to module "sg".
+	writeFile(t, dir, "main.tf", `module "sg" {
+  source = "./modules/sg"
+  rules  = [{ from_port = 80, to_port = 80, protocol = "tcp" }]
+}
+`)
+	// Module uses a dynamic block driven by var.rules.
+	writeFile(t, dir, "modules/sg/main.tf", `variable "rules" {}
+
+resource "aws_security_group" "sg" {
+  dynamic "ingress" {
+    for_each = var.rules
+    content {
+      from_port = ingress.value.from_port
+      to_port   = ingress.value.to_port
+      protocol  = ingress.value.protocol
+    }
+  }
+}
+`)
+	// Plan JSON: for_each references var.rules in the nested block expression,
+	// and the root module call passes it as a constant_value list.
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"sg":{
+			"source":"./modules/sg",
+			"expressions":{"rules":{"constant_value":[{"from_port":80,"to_port":80,"protocol":"tcp"}]}},
+			"module":{
+				"variables":{"rules":{}},
+				"resources":[{"address":"aws_security_group.sg","mode":"managed","type":"aws_security_group","name":"sg",
+					"expressions":{}}]
+			}
+		}}
+	}}}`
+	// Drift: 443 ingress block added out-of-band.
+	drifts := []tfplan.Drift{{
+		Address: "module.sg.aws_security_group.sg",
+		Type: "aws_security_group", Name: "sg",
+		Before: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+			},
+		},
+		After: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change (root module call), got %d", len(changes))
+	}
+	// Edit must land on ROOT main.tf, not the module source.
+	if strings.Contains(changes[0].Path, "modules") {
+		t.Errorf("edited module source instead of root call: %s", changes[0].Path)
+	}
+	got := string(changes[0].After)
+	// New block values must appear in the rules collection.
+	if !strings.Contains(got, "443") {
+		t.Errorf("new ingress rule not absorbed into rules collection:\n%s", got)
+	}
+	// Original 80 values must be preserved.
+	if !strings.Contains(got, "80") {
+		t.Errorf("original ingress rule lost:\n%s", got)
+	}
+	// Module source must be untouched (no literal ingress {} added).
+	src, _ := os.ReadFile(filepath.Join(dir, "modules/sg/main.tf"))
+	if strings.Contains(string(src), "from_port = 443") {
+		t.Errorf("literal ingress block was incorrectly added to module source:\n%s", src)
+	}
+	if !strings.Contains(string(src), `dynamic "ingress"`) {
+		t.Errorf("dynamic block was modified or removed from module source:\n%s", src)
+	}
+}
+
+// TestDynamicBlockNonVarForEach: dynamic block's for_each derives from a local —
+// cannot trace; must be reported as unresolved.
+func TestDynamicBlockNonVarForEach(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `locals {
+  rules = [{ from_port = 80, to_port = 80, protocol = "tcp" }]
+}
+
+resource "aws_security_group" "sg" {
+  dynamic "ingress" {
+    for_each = local.rules
+    content {
+      from_port = ingress.value.from_port
+      to_port   = ingress.value.to_port
+      protocol  = ingress.value.protocol
+    }
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_security_group.sg","mode":"managed","type":"aws_security_group","name":"sg","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
+		Before: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+			},
+		},
+		After: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (local.rules not traceable), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "local") {
+		t.Fatalf("want 1 local-unresolvable unresolved, got %v", unresolved)
+	}
 }

@@ -14,11 +14,12 @@ import (
 // Drift describes a single resource whose real-world state diverged from prior
 // Terraform state. Before is what Terraform recorded; After is refreshed reality.
 type Drift struct {
-	Address string                 // e.g. "aws_instance.web"
-	Type    string                 // e.g. "aws_instance"
-	Name    string                 // e.g. "web"
-	Before  map[string]interface{} // prior state attributes
-	After   map[string]interface{} // refreshed real-world attributes
+	Address        string                 // e.g. "aws_instance.web"
+	Type           string                 // e.g. "aws_instance"
+	Name           string                 // e.g. "web"
+	Before         map[string]interface{} // prior state attributes
+	After          map[string]interface{} // refreshed real-world attributes
+	AfterSensitive interface{}            // nil | bool | map[string]interface{}
 }
 
 // planJSON is the subset of `terraform show -json` we consume.
@@ -28,8 +29,9 @@ type planJSON struct {
 		Type    string `json:"type"`
 		Name    string `json:"name"`
 		Change  struct {
-			Before map[string]interface{} `json:"before"`
-			After  map[string]interface{} `json:"after"`
+			Before         map[string]interface{} `json:"before"`
+			After          map[string]interface{} `json:"after"`
+			AfterSensitive interface{}            `json:"after_sensitive"`
 		} `json:"change"`
 	} `json:"resource_drift"`
 }
@@ -81,11 +83,12 @@ func ParseDrift(raw []byte) ([]Drift, error) {
 	drifts := make([]Drift, 0, len(pj.ResourceDrift))
 	for _, rd := range pj.ResourceDrift {
 		drifts = append(drifts, Drift{
-			Address: rd.Address,
-			Type:    rd.Type,
-			Name:    rd.Name,
-			Before:  rd.Change.Before,
-			After:   rd.Change.After,
+			Address:        rd.Address,
+			Type:           rd.Type,
+			Name:           rd.Name,
+			Before:         rd.Change.Before,
+			After:          rd.Change.After,
+			AfterSensitive: rd.Change.AfterSensitive,
 		})
 	}
 	return drifts, nil

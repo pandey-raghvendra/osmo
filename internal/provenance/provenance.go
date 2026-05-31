@@ -170,6 +170,17 @@ func resolveVar(root *config.Module, addr address.Addr, depth int, varName, attr
 	return resolveVar(root, addr, depth-1, ref, attr, value, instanced, instKey)
 }
 
+// TraceForEach resolves the for_each collection variable of a dynamic block to
+// an edit Target. varName is the raw variable name (no "var." prefix) extracted
+// from the dynamic block's for_each expression in the HCL source; value is the
+// full after-collection ([]interface{} of block attribute maps) that the
+// for_each variable should be set to.
+func TraceForEach(root *config.Module, addr address.Addr, varName string, value interface{}) (*Target, *Unresolved) {
+	depth := len(addr.Modules)
+	instanced, instKey := instancing(addr)
+	return resolveVar(root, addr, depth, varName, "dynamic.for_each("+varName+")", value, instanced, instKey)
+}
+
 // TraceNested resolves a drifted attribute inside a nested block to an edit
 // Target by reading the block's expression from the configuration tree and
 // following the same var-chain logic as Trace.

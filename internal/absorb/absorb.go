@@ -12,6 +12,7 @@
 package absorb
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -87,6 +88,22 @@ type BlockStructuralChange struct {
 	Removed   []map[string]interface{}
 }
 
+// DynamicBlockUpdate is emitted for every slice (nested-block) attribute in a
+// drift. During the apply phase Plan() checks whether the block type is
+// implemented with a Terraform `dynamic` block; if so, the for_each collection
+// variable is updated to AfterFull instead of manipulating individual blocks.
+// For literal blocks this op is a no-op (regular BlockAttrEdit / BlockStructural-
+// Change ops handle them).
+type DynamicBlockUpdate struct {
+	DriftAddr string
+	ResType   string
+	ResName   string
+	ResMode   string
+	Steps     []BlockStep             // path to the body containing the dynamic block
+	BlockType string                  // the dynamic block's label, e.g. "ingress"
+	AfterFull []map[string]interface{} // complete after-state of this block type
+}
+
 // ---- Plan ---------------------------------------------------------------
 
 // Plan computes HCL rewrites for baseDir that absorb the given drifts.
@@ -119,6 +136,12 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 	var nestedAttrOps []nestedAttrOp
 	var nestedStructOps []nestedStructOp
 
+	type dynUpdateOp struct {
+		addr   address.Addr
+		update DynamicBlockUpdate
+	}
+	var dynUpdateOps []dynUpdateOp
+
 	for _, d := range drifts {
 		addr, err := address.Parse(d.Address)
 		if err != nil {
@@ -138,6 +161,22 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			if _, isSlice := av.([]interface{}); isSlice {
 				continue // handled by walkDriftMap below
 			}
+			// Guard: null after-value means the attr was removed in reality.
+			if av == nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: d.Address, Attr: k,
+					Reason: "after value is null (attribute removed in reality); removal from config not supported automatically",
+				})
+				continue
+			}
+			// Guard: sensitive after-value must not be written to plain-text config.
+			if isSensitiveAttr(d.AfterSensitive, k) {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: d.Address, Attr: k,
+					Reason: "sensitive value — cannot absorb into plain-text config",
+				})
+				continue
+			}
 			t, u := provenance.Trace(root, addr, k, av)
 			if u != nil {
 				unresolved = append(unresolved, *u)
@@ -148,14 +187,18 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 
 		// Nested block attrs + structural changes → recursive walk.
 		// walkDriftMap skips root-level scalars (handled above) and emits
-		// BlockAttrEdits for nested literals and BlockStructuralChanges for
-		// count-change (add/remove) events.
-		blockEdits, blockStructs := walkDriftMap(addr, d.Address, nil, d.Before, d.After)
+		// BlockAttrEdits for nested literals, BlockStructuralChanges for
+		// count-change events, and DynamicBlockUpdates for every slice attr
+		// (used if the block type is implemented with a `dynamic` block).
+		blockEdits, blockStructs, blockDynUpdates := walkDriftMap(addr, d.Address, nil, d.Before, d.After)
 		for _, e := range blockEdits {
 			nestedAttrOps = append(nestedAttrOps, nestedAttrOp{addr, e})
 		}
 		for _, s := range blockStructs {
 			nestedStructOps = append(nestedStructOps, nestedStructOp{addr, s})
+		}
+		for _, u := range blockDynUpdates {
+			dynUpdateOps = append(dynUpdateOps, dynUpdateOp{addr, u})
 		}
 	}
 
@@ -277,6 +320,54 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		unresolved = append(unresolved, urs...)
 		for _, attr := range absorbed {
 			record(path, o.change.DriftAddr, attr)
+		}
+	}
+
+	// Dynamic block update ops: update the for_each collection variable when
+	// drift involves a `dynamic` block rather than literal nested blocks.
+	for _, o := range dynUpdateOps {
+		dir, err := resolveDir(root, baseDir, o.addr.Modules)
+		if err != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.update.DriftAddr,
+				Attr:    o.update.BlockType + ".for_each",
+				Reason:  err.Error(),
+			})
+			continue
+		}
+		de, err := getEditor(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		qualAttr, redirect, u := de.applyDynamicBlockUpdate(o.update, o.addr, root)
+		if u != nil {
+			unresolved = append(unresolved, *u)
+			continue
+		}
+		if redirect == nil {
+			// No dynamic block found for this block type → regular ops handled it.
+			continue
+		}
+		redirectDir, dirErr := resolveDir(root, baseDir, redirect.SourceModulePath)
+		if dirErr != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.update.DriftAddr, Attr: qualAttr, Reason: dirErr.Error(),
+			})
+			continue
+		}
+		rde, deErr := getEditor(redirectDir)
+		if deErr != nil {
+			return nil, nil, deErr
+		}
+		rpath, applyErr := rde.apply(redirect)
+		if applyErr != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.update.DriftAddr, Attr: qualAttr, Reason: applyErr.Error(),
+			})
+			continue
+		}
+		if rpath != "" {
+			record(rpath, o.update.DriftAddr, qualAttr)
 		}
 	}
 
@@ -451,6 +542,8 @@ func setAttr(block *hclwrite.Block, attr string, value interface{}, key *string)
 // walkDriftMap recursively walks a before/after map pair and emits:
 //   - BlockAttrEdits for scalar attr changes INSIDE nested blocks (path != nil)
 //   - BlockStructuralChanges for nested block count changes at any depth
+//   - DynamicBlockUpdates for every slice attr (used if the block type is a
+//     Terraform `dynamic` block; no-op otherwise)
 //
 // Root-level scalar attrs (path == nil) are skipped because those go through
 // the provenance path in Plan.
@@ -459,7 +552,7 @@ func walkDriftMap(
 	driftAddr string,
 	path []BlockStep,
 	before, after map[string]interface{},
-) (edits []BlockAttrEdit, structs []BlockStructuralChange) {
+) (edits []BlockAttrEdit, structs []BlockStructuralChange, dynUpdates []DynamicBlockUpdate) {
 	for k, av := range after {
 		bv := before[k]
 		if reflect.DeepEqual(bv, av) {
@@ -489,6 +582,18 @@ func walkDriftMap(
 		bMaps := toMapSlice(beforeSlice)
 		aMaps := toMapSlice(afterSlice)
 
+		// Always emit a DynamicBlockUpdate for the full after collection.
+		// applyDynamicBlockUpdate is a no-op for literal (non-dynamic) blocks.
+		dynUpdates = append(dynUpdates, DynamicBlockUpdate{
+			DriftAddr: driftAddr,
+			ResType:   addr.Type,
+			ResName:   addr.Name,
+			ResMode:   addr.Mode,
+			Steps:     path,
+			BlockType: k,
+			AfterFull: aMaps,
+		})
+
 		if len(bMaps) == len(aMaps) {
 			// Same count: blocks are the same logical instances with drifted
 			// attrs. Match positionally — no structural change.
@@ -500,9 +605,10 @@ func walkDriftMap(
 				}
 				newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
 				newPath := append(append([]BlockStep(nil), path...), newStep)
-				subEdits, subStructs := walkDriftMap(addr, driftAddr, newPath, bm, am)
+				subEdits, subStructs, subDyn := walkDriftMap(addr, driftAddr, newPath, bm, am)
 				edits = append(edits, subEdits...)
 				structs = append(structs, subStructs...)
+				dynUpdates = append(dynUpdates, subDyn...)
 			}
 		} else {
 			// Different count: some blocks were added or removed out-of-band.
@@ -536,9 +642,10 @@ func walkDriftMap(
 				}
 				newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
 				newPath := append(append([]BlockStep(nil), path...), newStep)
-				subEdits, subStructs := walkDriftMap(addr, driftAddr, newPath, bm, am)
+				subEdits, subStructs, subDyn := walkDriftMap(addr, driftAddr, newPath, bm, am)
 				edits = append(edits, subEdits...)
 				structs = append(structs, subStructs...)
+				dynUpdates = append(dynUpdates, subDyn...)
 			}
 		}
 	}
@@ -675,11 +782,22 @@ func (de *dirEditor) applyBlockStructChange(sc BlockStructuralChange) (path stri
 		}
 		parentBody, err := navigateNestedPath(resBlock.Body(), sc.Steps)
 		if err != nil {
+			// Navigation may fail because an intermediate step is a dynamic block.
+			// In that case DynamicBlockUpdate ops handle the change; skip silently.
+			if isDynamicAtPath(resBlock.Body(), sc.Steps) {
+				return p, nil, nil
+			}
 			unresolved = append(unresolved, provenance.Unresolved{
 				Address: sc.DriftAddr, Attr: sc.BlockType,
 				Reason: "could not navigate to parent block: " + err.Error(),
 			})
 			return p, nil, unresolved
+		}
+
+		// If the block type is managed by a dynamic block, skip direct block
+		// manipulation — DynamicBlockUpdate ops handle the for_each update.
+		if findDynamicBlock(parentBody, sc.BlockType) != nil {
+			return p, nil, nil
 		}
 
 		// Remove blocks that disappeared out-of-band.
@@ -817,6 +935,138 @@ func generateHCLBlock(blockType string, attrs map[string]interface{}) *hclwrite.
 	return b
 }
 
+// ---- Dynamic block engine -----------------------------------------------
+
+// applyDynamicBlockUpdate looks for a `dynamic "blockType"` block in the
+// resource body navigated by u.Steps. If found, it extracts the for_each
+// variable name and returns a provenance Target that updates the collection
+// variable to u.AfterFull. Returns (qualAttr, nil, nil) when no dynamic block
+// exists (regular ops cover literal blocks).
+func (de *dirEditor) applyDynamicBlockUpdate(u DynamicBlockUpdate, addr address.Addr, root *config.Module) (qualAttr string, redirect *provenance.Target, ur *provenance.Unresolved) {
+	outerType := "resource"
+	if u.ResMode == "data" {
+		outerType = "data"
+	}
+	qualAttr = u.BlockType + ".for_each"
+
+	for _, ff := range de.files {
+		resBlock := ff.f.Body().FirstMatchingBlock(outerType, []string{u.ResType, u.ResName})
+		if resBlock == nil {
+			continue
+		}
+		parentBody, err := navigateNestedPath(resBlock.Body(), u.Steps)
+		if err != nil {
+			continue // intermediate step not found — not our file
+		}
+		dynBlock := findDynamicBlock(parentBody, u.BlockType)
+		if dynBlock == nil {
+			// No dynamic block — literal blocks handled by regular ops.
+			return qualAttr, nil, nil
+		}
+		varName, extractErr := extractForEachVarName(dynBlock.Body())
+		if extractErr != nil {
+			return qualAttr, nil, &provenance.Unresolved{
+				Address: u.DriftAddr, Attr: qualAttr, Reason: extractErr.Error(),
+			}
+		}
+		// Validate the current for_each value is a list/set (not a map) —
+		// map-keyed for_each would need different reconstruction.
+		if forEachIsMap(dynBlock.Body()) {
+			return qualAttr, nil, &provenance.Unresolved{
+				Address: u.DriftAddr, Attr: qualAttr,
+				Reason: "dynamic block uses a map for_each; collection reconstruction from drift not supported — update " + varName + " manually",
+			}
+		}
+		afterCollection := mapsToInterfaceSlice(u.AfterFull)
+		tgt, tu := provenance.TraceForEach(root, addr, varName, afterCollection)
+		if tu != nil {
+			return qualAttr, nil, tu
+		}
+		return qualAttr, tgt, nil
+	}
+	return qualAttr, nil, nil
+}
+
+// findDynamicBlock returns the first `dynamic "blockType"` block in body, or nil.
+func findDynamicBlock(body *hclwrite.Body, blockType string) *hclwrite.Block {
+	for _, b := range body.Blocks() {
+		if b.Type() == "dynamic" && len(b.Labels()) == 1 && b.Labels()[0] == blockType {
+			return b
+		}
+	}
+	return nil
+}
+
+// extractForEachVarName reads the for_each attribute from a dynamic block body
+// and returns the variable name if it is a direct `var.x` reference.
+func extractForEachVarName(body *hclwrite.Body) (string, error) {
+	attr := body.GetAttribute("for_each")
+	if attr == nil {
+		return "", fmt.Errorf("dynamic block has no for_each attribute")
+	}
+	exprBytes := bytes.TrimSpace(attr.Expr().BuildTokens(nil).Bytes())
+	expr, diags := hclsyntax.ParseExpression(exprBytes, "<for_each>", hcl.Pos{Line: 1, Column: 1})
+	if diags.HasErrors() {
+		return "", fmt.Errorf("parse for_each expression: %s", diags.Error())
+	}
+	tv, ok := expr.(*hclsyntax.ScopeTraversalExpr)
+	if !ok {
+		return "", fmt.Errorf("for_each is a composed expression; cannot trace automatically")
+	}
+	traversal := tv.Traversal
+	switch traversal.RootName() {
+	case "var":
+		if len(traversal) != 2 {
+			return "", fmt.Errorf("for_each references a sub-attribute of a variable (unsupported)")
+		}
+		ta, ok := traversal[1].(hcl.TraverseAttr)
+		if !ok {
+			return "", fmt.Errorf("unexpected traversal step type in for_each var reference")
+		}
+		return ta.Name, nil
+	case "local":
+		return "", fmt.Errorf("for_each derives from a local; locals are not in plan JSON")
+	default:
+		return "", fmt.Errorf("for_each references %q (not a direct var.x reference)", traversal.RootName())
+	}
+}
+
+// forEachIsMap returns true when the dynamic block's for_each expression
+// evaluates to a map/object type. Heuristic: if the for_each literal evaluates
+// without variable errors to a map/object cty value.
+func forEachIsMap(body *hclwrite.Body) bool {
+	v, err := evalBodyAttr(body, "for_each")
+	if err != nil {
+		// Variable ref — can't tell statically. Conservative: assume list.
+		return false
+	}
+	return v.Type().IsObjectType() || v.Type().IsMapType()
+}
+
+// isDynamicAtPath walks steps from root to check whether any step's block type
+// is absent as a literal block but present as a dynamic block. Used to
+// distinguish "navigation failed because of dynamic block" from other errors.
+func isDynamicAtPath(root *hclwrite.Body, steps []BlockStep) bool {
+	cur := root
+	for _, step := range steps {
+		block := findMatchingNestedBlock(cur, step.BlockType, step.Before, step.Drifted)
+		if block == nil {
+			return findDynamicBlock(cur, step.BlockType) != nil
+		}
+		cur = block.Body()
+	}
+	return false
+}
+
+// mapsToInterfaceSlice converts []map[string]interface{} to []interface{}.
+func mapsToInterfaceSlice(maps []map[string]interface{}) []interface{} {
+	result := make([]interface{}, len(maps))
+	for i, m := range maps {
+		result[i] = m
+	}
+	return result
+}
+
 // qualifiedAttr returns "blockA.blockB.attr" notation for a nested attr.
 func qualifiedAttr(steps []BlockStep, attr string) string {
 	if len(steps) == 0 {
@@ -856,6 +1106,34 @@ func evalBodyAttr(body *hclwrite.Body, attr string) (cty.Value, error) {
 // evalAttr is a convenience wrapper for callers that have a block reference.
 func evalAttr(block *hclwrite.Block, attr string) (cty.Value, error) {
 	return evalBodyAttr(block.Body(), attr)
+}
+
+// isSensitiveAttr returns true when attr is marked sensitive in afterSensitive.
+//
+// Terraform plan JSON uses after_sensitive as follows:
+//   - bool true  → the whole attribute value is sensitive
+//   - bool false → not sensitive
+//   - {}         → nested attribute exists but has no sensitive values
+//   - {key:true} → a nested key is sensitive, but the attr itself may not be
+//
+// We guard conservatively: skip only when the attr's entry is exactly the
+// boolean true. An empty map {}, false, or a nested map means the top-level
+// attr value is not wholly sensitive and can be absorbed safely.
+func isSensitiveAttr(afterSensitive interface{}, attr string) bool {
+	if afterSensitive == nil {
+		return false
+	}
+	// Whole resource marked sensitive.
+	if b, ok := afterSensitive.(bool); ok {
+		return b
+	}
+	m, ok := afterSensitive.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	v := m[attr]
+	b, ok := v.(bool)
+	return ok && b // only true when the attr is explicitly marked true
 }
 
 // toCty converts a JSON-decoded value into a cty.Value via its implied type.
