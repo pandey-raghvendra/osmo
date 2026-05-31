@@ -1,0 +1,8 @@
+/osmo
+*.tfplan
+.terraform/
+
+# local tooling cruft (not part of osmo)
+.agents/
+data/
+skills-lock.json
