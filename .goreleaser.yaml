@@ -35,6 +35,26 @@ archives:
       - LICENSE
       - README.md
 
+brews:
+  - name: osmo
+    repository:
+      owner: pandey-raghvendra
+      name: homebrew-osmo
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    homepage: "https://github.com/pandey-raghvendra/osmo"
+    description: "Terraform drift absorber — rewrites .tf files to match real-world state"
+    license: "Apache-2.0"
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    commit_msg_template: "Brew formula update for osmo {{ .Tag }}"
+    directory: Formula
+    install: |
+      bin.install "osmo"
+    test: |
+      system "#{bin}/osmo", "-version"
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
