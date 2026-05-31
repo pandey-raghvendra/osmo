@@ -173,7 +173,7 @@ osmo is **provider-agnostic**: it reads `terraform show -json` output and edits 
 
 ### Go install
 ```sh
-go install github.com/raghav/osmo/cmd/osmo@latest
+go install github.com/pandey-raghvendra/osmo/cmd/osmo@latest
 ```
 
 ### Build from source
