@@ -455,9 +455,8 @@ resource "aws_instance" "web" {
 	}
 }
 
-// TestNestedBlockCountChangeUnresolved: block count changed (add/remove) —
-// must be reported, never silently skipped.
-func TestNestedBlockCountChangeUnresolved(t *testing.T) {
+// TestNestedBlockAdd: a block was added out-of-band; osmo should append it.
+func TestNestedBlockAdd(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.tf", `resource "aws_security_group" "sg" {
   ingress {
@@ -474,13 +473,13 @@ func TestNestedBlockCountChangeUnresolved(t *testing.T) {
 		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
 		Before: map[string]interface{}{
 			"ingress": []interface{}{
-				map[string]interface{}{"from_port": float64(80), "to_port": float64(80)},
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 			},
 		},
 		After: map[string]interface{}{
 			"ingress": []interface{}{
-				map[string]interface{}{"from_port": float64(80), "to_port": float64(80)},
-				map[string]interface{}{"from_port": float64(443), "to_port": float64(443)}, // added out-of-band
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
 			},
 		},
 	}}
@@ -489,10 +488,158 @@ func TestNestedBlockCountChangeUnresolved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 0 {
-		t.Fatalf("want 0 changes (count change), got %d", len(changes))
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
 	}
-	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "count changed") {
-		t.Fatalf("want count-change unresolved, got %v", unresolved)
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
 	}
+	got := string(changes[0].After)
+	// New block must be appended.
+	if !strings.Contains(got, "from_port = 443") {
+		t.Errorf("added block not generated:\n%s", got)
+	}
+	// Original block must be preserved.
+	if !strings.Contains(got, "from_port = 80") {
+		t.Errorf("original block lost:\n%s", got)
+	}
+}
+
+// TestNestedBlockRemove: a block was removed out-of-band; osmo should remove it.
+func TestNestedBlockRemove(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_security_group" "sg" {
+  ingress {
+    from_port = 80
+    to_port   = 80
+    protocol  = "tcp"
+  }
+
+  ingress {
+    from_port = 443
+    to_port   = 443
+    protocol  = "tcp"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_security_group.sg","mode":"managed","type":"aws_security_group","name":"sg","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
+		Before: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
+			},
+		},
+		After: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	// 443 block must be gone.
+	if strings.Contains(got, "from_port = 443") {
+		t.Errorf("removed block still present:\n%s", got)
+	}
+	// 80 block must remain.
+	if !strings.Contains(got, "from_port = 80") {
+		t.Errorf("remaining block lost:\n%s", got)
+	}
+}
+
+// TestDeepNestedBlock: 3-level nesting (server_side_encryption_configuration >
+// rule > apply_server_side_encryption_by_default > sse_algorithm).
+func TestDeepNestedBlock(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_s3_bucket" "b" {
+  bucket = "my-bucket"
+
+  server_side_encryption_configuration {
+    rule {
+      apply_server_side_encryption_by_default {
+        sse_algorithm   = "AES256"
+        kms_master_key_id = ""
+      }
+      bucket_key_enabled = false
+    }
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_s3_bucket.b","mode":"managed","type":"aws_s3_bucket","name":"b",
+			"expressions":{"bucket":{"constant_value":"my-bucket"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_s3_bucket.b", Type: "aws_s3_bucket", Name: "b",
+		Before: map[string]interface{}{
+			"bucket": "my-bucket",
+			"server_side_encryption_configuration": []interface{}{
+				map[string]interface{}{
+					"rule": []interface{}{
+						map[string]interface{}{
+							"apply_server_side_encryption_by_default": []interface{}{
+								map[string]interface{}{
+									"sse_algorithm":     "AES256",
+									"kms_master_key_id": "",
+								},
+							},
+							"bucket_key_enabled": false,
+						},
+					},
+				},
+			},
+		},
+		After: map[string]interface{}{
+			"bucket": "my-bucket",
+			"server_side_encryption_configuration": []interface{}{
+				map[string]interface{}{
+					"rule": []interface{}{
+						map[string]interface{}{
+							"apply_server_side_encryption_by_default": []interface{}{
+								map[string]interface{}{
+									"sse_algorithm":     "aws:kms", // drifted
+									"kms_master_key_id": "arn:aws:kms:us-east-1:123:key/abc",
+								},
+							},
+							"bucket_key_enabled": true, // also drifted
+						},
+					},
+				},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	// hclwrite normalizes spacing on rewrite; check value only.
+	if !strings.Contains(got, `"aws:kms"`) {
+		t.Errorf("deep nested sse_algorithm not absorbed:\n%s", got)
+	}
+	if !strings.Contains(got, "bucket_key_enabled = true") {
+		t.Errorf("mid-level bucket_key_enabled not absorbed:\n%s", got)
+	}
+	// kms_master_key_id was not in config → skipped silently (computed).
 }
