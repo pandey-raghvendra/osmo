@@ -1,4 +1,4 @@
-module github.com/raghav/osmo
+module github.com/pandey-raghvendra/osmo
 
 go 1.25.6
 

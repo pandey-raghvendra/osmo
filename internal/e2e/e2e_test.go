@@ -13,8 +13,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/raghav/osmo/internal/absorb"
-	"github.com/raghav/osmo/internal/tfplan"
+	"github.com/pandey-raghvendra/osmo/internal/absorb"
+	"github.com/pandey-raghvendra/osmo/internal/tfplan"
 )
 
 // copyTF replicates only the .tf files under src into dst, preserving layout.

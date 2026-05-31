@@ -8,7 +8,7 @@ import (
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
-	"github.com/raghav/osmo/internal/tfplan"
+	"github.com/pandey-raghvendra/osmo/internal/tfplan"
 )
 
 // ---- Safety guard tests --------------------------------------------------

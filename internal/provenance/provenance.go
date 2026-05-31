@@ -11,8 +11,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/raghav/osmo/internal/address"
-	"github.com/raghav/osmo/internal/config"
+	"github.com/pandey-raghvendra/osmo/internal/address"
+	"github.com/pandey-raghvendra/osmo/internal/config"
 )
 
 // Kind enumerates the sort of HCL construct an edit lands on.
