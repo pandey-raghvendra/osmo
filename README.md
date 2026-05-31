@@ -30,6 +30,7 @@ terraform -chdir=./infra plan   # should show: No changes
 | `-dir` | `.` | Terraform working directory |
 | `-terraform` | `terraform` | Terraform binary path |
 | `-write` | `false` | Write changes to disk (else diff only) |
+| `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
 
 ---
 
@@ -144,6 +145,38 @@ module "sg" {
 ```
 
 Drift that added the 443 rule out-of-band causes osmo to update the `rules` list in the root module call — no literal `ingress {}` block is injected.
+
+---
+
+## Terraform Cloud / Remote execution
+
+TFC remote execution does not allow saving local plan files (`-out` is unsupported). Use `-plan-json` to pass a pre-generated plan instead:
+
+```sh
+# 1. In TFC web UI: run a speculative refresh-only plan, then download the JSON
+#    Plans → <run> → Download JSON → save as plan.json
+#
+# OR via TFC API (requires TF_TOKEN_app_terraform_io):
+TFC_ORG=my-org
+TFC_WORKSPACE=my-workspace
+RUN_ID=$(curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d '{"data":{"attributes":{"refresh-only":true,"plan-only":true},"type":"runs","relationships":{"workspace":{"data":{"type":"workspaces","id":"'$(
+    curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
+    "https://app.terraform.io/api/v2/organizations/$TFC_ORG/workspaces/$TFC_WORKSPACE" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])"
+  )'"}}}}' \
+  https://app.terraform.io/api/v2/runs | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
+# poll until planned, then:
+curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
+  "https://app.terraform.io/api/v2/runs/$RUN_ID/plan/json-output" > plan.json
+
+# 2. Run osmo against your local .tf sources with the downloaded plan
+osmo -plan-json plan.json -dir ./infra
+osmo -plan-json plan.json -dir ./infra -write
+```
+
+**If you use TFC only for remote state** (not remote execution), switch the workspace execution mode to **Local** — then `osmo -dir ./infra` works with no extra steps.
 
 ---
 

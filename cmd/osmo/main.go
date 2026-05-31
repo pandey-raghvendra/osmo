@@ -27,6 +27,7 @@ func main() {
 	dir := flag.String("dir", ".", "Terraform working directory")
 	bin := flag.String("terraform", "terraform", "Terraform binary to use")
 	write := flag.Bool("write", false, "Write absorbed changes to disk (default: diff only)")
+	planFile := flag.String("plan-json", "", "Path to pre-generated `terraform show -json` output (skips plan detection; use with Terraform Cloud or CI)")
 	ver := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
 
@@ -38,18 +39,37 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := run(ctx, *dir, *bin, *write); err != nil {
+	if err := run(ctx, *dir, *bin, *planFile, *write); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, dir, bin string, write bool) error {
-	fmt.Fprintln(os.Stderr, "detecting drift (terraform plan -refresh-only)...")
-	drifts, raw, err := tfplan.Detect(ctx, dir, bin)
-	if err != nil {
-		return err
+func run(ctx context.Context, dir, bin, planFile string, write bool) error {
+	var drifts []tfplan.Drift
+	var raw []byte
+	var err error
+
+	if planFile != "" {
+		// Pre-generated plan JSON supplied (e.g. from Terraform Cloud, Atlantis, CI).
+		// Skip local plan detection entirely.
+		raw, err = os.ReadFile(planFile)
+		if err != nil {
+			return fmt.Errorf("read plan json %s: %w", planFile, err)
+		}
+		drifts, err = tfplan.ParseDrift(raw)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "using plan json: %s (%d drift(s))\n", planFile, len(drifts))
+	} else {
+		fmt.Fprintln(os.Stderr, "detecting drift (terraform plan -refresh-only)...")
+		drifts, raw, err = tfplan.Detect(ctx, dir, bin)
+		if err != nil {
+			return err
+		}
 	}
+
 	if len(drifts) == 0 {
 		fmt.Println("no drift detected.")
 		return nil
