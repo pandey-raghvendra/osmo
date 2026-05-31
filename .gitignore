@@ -6,3 +6,9 @@
 .agents/
 data/
 skills-lock.json
+
+# e2e fixture local terraform artifacts (real_show.json IS committed)
+internal/e2e/testdata/fixture/.terraform/
+internal/e2e/testdata/fixture/.terraform.lock.hcl
+internal/e2e/testdata/fixture/*.tfstate*
+internal/e2e/testdata/fixture/tf.plan
