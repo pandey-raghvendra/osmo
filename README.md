@@ -51,13 +51,43 @@ Flags:
 | `-terraform` | `terraform`   | Terraform binary to invoke           |
 | `-write`     | `false`       | Write changes to disk (else diff only)|
 
+## Module-aware (custom modules)
+
+osmo is provenance-driven, not a naive HCL grep. Each drifted attribute is
+traced through the plan's `configuration` tree to the **single literal** that
+controls it, which may be:
+
+- a resource attribute in the root module,
+- a **module-call argument** in the root (when the module sets `attr = var.x`),
+- the same, chained through **nested modules** (`module.a.module.b...`),
+- a **variable default**.
+
+The edit lands at the literal's real source — for module inputs that means the
+**root call argument** (correct blast radius: only that instance), never the
+shared module source.
+
+**Instance scoping (`for_each`/`count`):** when a drifted instance maps to one
+entry of a map argument, osmo edits just that entry and leaves siblings intact.
+
+**Safely skipped & reported (never silently wrong):**
+
+- values derived from `local.*` (not present in plan JSON),
+- `each.*` / `count.*` meta-arguments,
+- references to other resources/outputs or composed expressions,
+- constants hardcoded inside a **remote** module source (registry/git),
+- a constant shared across instances that cannot be isolated.
+
+Each skip prints `! <address>.<attr>: <reason>`.
+
 ## Scope
 
-**v1 (now):** modify attribute drift on resources already in HCL; diff to stdout.
+**Now:** attribute drift on existing resources, through local custom modules
+(root + nested), with instance scoping; diff to stdout (`-write` to apply).
 
 **Not yet:**
 - Out-of-band *created* resources (needs `import {}` block + HCL codegen)
-- Nested block / nested attribute drift (only top-level attrs today)
+- Nested *block* drift (e.g. `ebs_block_device {}`) — top-level attrs only
+- `local.*` provenance (locals aren't in plan JSON)
 - PR creation (planned — open a branch + PR instead of local diff)
 
 ## License

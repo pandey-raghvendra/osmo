@@ -34,7 +34,7 @@ func main() {
 
 func run(ctx context.Context, dir, bin string, write bool) error {
 	fmt.Fprintln(os.Stderr, "detecting drift (terraform plan -refresh-only)...")
-	drifts, err := tfplan.Detect(ctx, dir, bin)
+	drifts, raw, err := tfplan.Detect(ctx, dir, bin)
 	if err != nil {
 		return err
 	}
@@ -43,13 +43,9 @@ func run(ctx context.Context, dir, bin string, write bool) error {
 		return nil
 	}
 
-	changes, err := absorb.Plan(dir, drifts)
+	changes, unresolved, err := absorb.Plan(dir, drifts, raw)
 	if err != nil {
 		return err
-	}
-	if len(changes) == 0 {
-		fmt.Printf("%d resource(s) drifted, but no absorbable config attributes changed.\n", len(drifts))
-		return nil
 	}
 
 	for _, c := range changes {
@@ -65,9 +61,21 @@ func run(ctx context.Context, dir, bin string, write bool) error {
 		}
 	}
 
-	if write {
+	if len(unresolved) > 0 {
+		fmt.Printf("\n%d drift(s) not auto-absorbed:\n", len(unresolved))
+		for _, u := range unresolved {
+			fmt.Printf("  ! %s.%s: %s\n", u.Address, u.Attr, u.Reason)
+		}
+	}
+
+	switch {
+	case len(changes) == 0 && len(unresolved) == 0:
+		fmt.Printf("%d resource(s) drifted, but no absorbable config attributes changed.\n", len(drifts))
+	case len(changes) == 0:
+		fmt.Println("\nno changes proposed; see unresolved drift above.")
+	case write:
 		fmt.Printf("\nwrote %d file change(s). run `terraform plan` to verify drift resolved.\n", len(changes))
-	} else {
+	default:
 		fmt.Printf("\n%d file change(s) proposed. re-run with -write to apply, then `terraform plan` to verify.\n", len(changes))
 	}
 	return nil

@@ -36,14 +36,17 @@ type planJSON struct {
 
 // Detect runs a refresh-only plan in dir and returns detected drift.
 // terraformBin lets callers override the binary (default "terraform").
-func Detect(ctx context.Context, dir, terraformBin string) ([]Drift, error) {
+//
+// It also returns the raw `terraform show -json` output, which carries the
+// configuration tree used for provenance tracing.
+func Detect(ctx context.Context, dir, terraformBin string) ([]Drift, []byte, error) {
 	if terraformBin == "" {
 		terraformBin = "terraform"
 	}
 
 	planFile, err := os.CreateTemp(dir, "drift-*.tfplan")
 	if err != nil {
-		return nil, fmt.Errorf("create temp plan file: %w", err)
+		return nil, nil, fmt.Errorf("create temp plan file: %w", err)
 	}
 	planPath := planFile.Name()
 	planFile.Close()
@@ -53,20 +56,28 @@ func Detect(ctx context.Context, dir, terraformBin string) ([]Drift, error) {
 	if err := run(ctx, dir, terraformBin,
 		"plan", "-refresh-only", "-input=false", "-no-color",
 		"-out="+filepath.Base(planPath)); err != nil {
-		return nil, fmt.Errorf("terraform plan -refresh-only: %w", err)
+		return nil, nil, fmt.Errorf("terraform plan -refresh-only: %w", err)
 	}
 
-	out, err := output(ctx, dir, terraformBin,
+	raw, err := output(ctx, dir, terraformBin,
 		"show", "-json", filepath.Base(planPath))
 	if err != nil {
-		return nil, fmt.Errorf("terraform show -json: %w", err)
+		return nil, nil, fmt.Errorf("terraform show -json: %w", err)
 	}
 
+	drifts, err := ParseDrift(raw)
+	if err != nil {
+		return nil, nil, err
+	}
+	return drifts, raw, nil
+}
+
+// ParseDrift extracts resource drift from raw `terraform show -json` output.
+func ParseDrift(raw []byte) ([]Drift, error) {
 	var pj planJSON
-	if err := json.Unmarshal(out, &pj); err != nil {
+	if err := json.Unmarshal(raw, &pj); err != nil {
 		return nil, fmt.Errorf("parse plan json: %w", err)
 	}
-
 	drifts := make([]Drift, 0, len(pj.ResourceDrift))
 	for _, rd := range pj.ResourceDrift {
 		drifts = append(drifts, Drift{

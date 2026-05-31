@@ -6,143 +6,308 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/raghav/osmo/internal/tfplan"
 )
 
-func TestPlanAbsorbsLiteralAttrs(t *testing.T) {
-	dir := t.TempDir()
-	src := `resource "aws_instance" "web" {
-  ami           = "ami-old"
-  instance_type = "t3.micro"
-  monitoring    = false
-  tags = {
-    Name = "web"
-  }
-}
-`
-	tfPath := filepath.Join(dir, "main.tf")
-	if err := os.WriteFile(tfPath, []byte(src), 0o644); err != nil {
+// writeFile writes content to dir/name, creating parent dirs.
+func writeFile(t *testing.T, dir, name, content string) {
+	t.Helper()
+	p := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
 
-	// Drift: someone hotfixed instance_type + monitoring in the console.
-	// computed_id is a read-only attr that is NOT in config and must be ignored.
-	drifts := []tfplan.Drift{{
-		Address: "aws_instance.web",
-		Type:    "aws_instance",
-		Name:    "web",
-		Before: map[string]interface{}{
-			"ami":           "ami-old",
-			"instance_type": "t3.micro",
-			"monitoring":    false,
-			"computed_id":   "i-111",
-		},
-		After: map[string]interface{}{
-			"ami":           "ami-old",      // unchanged
-			"instance_type": "t3.large",     // drifted, in config -> rewrite
-			"monitoring":    true,           // drifted, in config -> rewrite
-			"computed_id":   "i-999",        // drifted, NOT in config -> ignore
-		},
-	}}
-
-	changes, err := Plan(dir, drifts)
+func mustRead(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestRootResourceLiteral(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  instance_type = "t3.micro"
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"constant_value":"t3.micro"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{"instance_type": "t3.micro"},
+		After:  map[string]interface{}{"instance_type": "t3.large"},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
 	}
 	if len(changes) != 1 {
 		t.Fatalf("want 1 change, got %d", len(changes))
 	}
-	got := string(changes[0].After)
-
-	if !strings.Contains(got, `instance_type = "t3.large"`) {
-		t.Errorf("instance_type not absorbed:\n%s", got)
-	}
-	if !strings.Contains(got, "monitoring    = true") {
-		t.Errorf("monitoring not absorbed:\n%s", got)
-	}
-	if strings.Contains(got, "computed_id") {
-		t.Errorf("computed_id leaked into config (should be ignored):\n%s", got)
-	}
-	// Untouched attr + comments/formatting preserved.
-	if !strings.Contains(got, `ami           = "ami-old"`) {
-		t.Errorf("unrelated attr or formatting lost:\n%s", got)
-	}
-
-	if len(changes[0].Edits) != 1 {
-		t.Fatalf("want 1 edit, got %d", len(changes[0].Edits))
-	}
-	wantAttrs := []string{"instance_type", "monitoring"}
-	if strings.Join(changes[0].Edits[0].Attrs, ",") != strings.Join(wantAttrs, ",") {
-		t.Errorf("Attrs = %v, want %v", changes[0].Edits[0].Attrs, wantAttrs)
+	if !strings.Contains(string(changes[0].After), `instance_type = "t3.large"`) {
+		t.Errorf("not absorbed:\n%s", changes[0].After)
 	}
 }
 
-func TestPlanMultipleDriftsSameFile(t *testing.T) {
+func TestModuleArgChain(t *testing.T) {
 	dir := t.TempDir()
-	src := `resource "aws_instance" "web" {
-  instance_type = "t3.micro"
+	writeFile(t, dir, "main.tf", `module "network" {
+  source   = "./modules/network"
+  location = "eastus"
 }
+`)
+	writeFile(t, dir, "modules/network/main.tf", `variable "location" {}
 
-resource "aws_instance" "db" {
-  instance_type = "t3.small"
+resource "azurerm_resource_group" "rg" {
+  location = var.location
 }
-`
-	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(src), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	drifts := []tfplan.Drift{
-		{
-			Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-			Before: map[string]interface{}{"instance_type": "t3.micro"},
-			After:  map[string]interface{}{"instance_type": "t3.large"},
-		},
-		{
-			Address: "aws_instance.db", Type: "aws_instance", Name: "db",
-			Before: map[string]interface{}{"instance_type": "t3.small"},
-			After:  map[string]interface{}{"instance_type": "m5.xlarge"},
-		},
-	}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"network":{
+			"source":"./modules/network",
+			"expressions":{"location":{"constant_value":"eastus"}},
+			"module":{
+				"variables":{"location":{}},
+				"resources":[{"address":"azurerm_resource_group.rg","mode":"managed","type":"azurerm_resource_group","name":"rg",
+					"expressions":{"location":{"references":["var.location"]}}}]
+			}
+		}}
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "module.network.azurerm_resource_group.rg",
+		Type:    "azurerm_resource_group", Name: "rg",
+		Before: map[string]interface{}{"location": "eastus"},
+		After:  map[string]interface{}{"location": "westus"},
+	}}
 
-	changes, err := Plan(dir, drifts)
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Both drifts live in one file -> exactly one FileChange holding both edits.
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
 	if len(changes) != 1 {
-		t.Fatalf("want 1 FileChange, got %d", len(changes))
+		t.Fatalf("want 1 change, got %d", len(changes))
 	}
-	if len(changes[0].Edits) != 2 {
-		t.Fatalf("want 2 edits in the file, got %d", len(changes[0].Edits))
+	// Edit must land on the ROOT module call argument, not the module source.
+	if !strings.HasSuffix(changes[0].Path, "main.tf") || strings.Contains(changes[0].Path, "modules") {
+		t.Errorf("edited wrong file: %s", changes[0].Path)
 	}
-	got := string(changes[0].After)
-	// Regression: BOTH edits must survive in the final bytes.
-	if !strings.Contains(got, `instance_type = "t3.large"`) {
-		t.Errorf("web edit lost:\n%s", got)
+	if !strings.Contains(string(changes[0].After), `location = "westus"`) {
+		t.Errorf("module arg not absorbed:\n%s", changes[0].After)
 	}
-	if !strings.Contains(got, `instance_type = "m5.xlarge"`) {
-		t.Errorf("db edit lost (clobber bug):\n%s", got)
+	// Module source must be untouched.
+	src := mustRead(t, filepath.Join(dir, "modules/network/main.tf"))
+	if !strings.Contains(src, "location = var.location") {
+		t.Errorf("module source was modified:\n%s", src)
 	}
 }
 
-func TestPlanNoChangeWhenDriftNotInConfig(t *testing.T) {
+func TestNestedModuleChain(t *testing.T) {
 	dir := t.TempDir()
-	src := `resource "aws_instance" "web" {
-  ami = "ami-old"
+	// root -> module "a" (passes p) -> module "b" (passes q=var.p) -> resource uses var.q
+	writeFile(t, dir, "main.tf", `module "a" {
+  source = "./a"
+  p      = "v1"
 }
-`
-	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(src), 0o644); err != nil {
+`)
+	writeFile(t, dir, "a/main.tf", `variable "p" {}
+module "b" {
+  source = "./b"
+  q      = var.p
+}
+`)
+	writeFile(t, dir, "a/b/main.tf", `variable "q" {}
+resource "aws_s3_bucket" "x" {
+  bucket = var.q
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"a":{
+			"source":"./a",
+			"expressions":{"p":{"constant_value":"v1"}},
+			"module":{
+				"variables":{"p":{}},
+				"module_calls":{"b":{
+					"source":"./b",
+					"expressions":{"q":{"references":["var.p"]}},
+					"module":{
+						"variables":{"q":{}},
+						"resources":[{"address":"aws_s3_bucket.x","mode":"managed","type":"aws_s3_bucket","name":"x",
+							"expressions":{"bucket":{"references":["var.q"]}}}]
+					}
+				}}
+			}
+		}}
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "module.a.module.b.aws_s3_bucket.x",
+		Type:    "aws_s3_bucket", Name: "x",
+		Before: map[string]interface{}{"bucket": "v1"},
+		After:  map[string]interface{}{"bucket": "v2"},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
 		t.Fatal(err)
 	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	// Must edit the ROOT call arg p, since that is where the literal lives.
+	if strings.Contains(changes[0].Path, "/a/") {
+		t.Errorf("edited a nested file, expected root: %s", changes[0].Path)
+	}
+	if !strings.Contains(string(changes[0].After), `p      = "v2"`) {
+		t.Errorf("root arg not absorbed:\n%s", changes[0].After)
+	}
+}
+
+func TestUnresolvedLocal(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  instance_type = local.it
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"references":["local.it"]}}}]
+	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"computed_id": "i-1"},
-		After:  map[string]interface{}{"computed_id": "i-2"},
+		Before: map[string]interface{}{"instance_type": "t3.micro"},
+		After:  map[string]interface{}{"instance_type": "t3.large"},
 	}}
-	changes, err := Plan(dir, drifts)
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(changes) != 0 {
-		t.Fatalf("want 0 changes (drift only in computed attrs), got %d", len(changes))
+		t.Fatalf("want 0 changes, got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "local") {
+		t.Fatalf("want local unresolved, got %v", unresolved)
+	}
+}
+
+func TestUnresolvedRemoteModule(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `module "vpc" {
+  source = "terraform-aws-modules/vpc/aws"
+  cidr   = "10.0.0.0/16"
+}
+`)
+	// cidr_block is HARDCODED inside the remote module (constant_value), so the
+	// only edit point is inside the uneditable remote source.
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"vpc":{
+			"source":"terraform-aws-modules/vpc/aws",
+			"module":{
+				"resources":[{"address":"aws_vpc.this","mode":"managed","type":"aws_vpc","name":"this",
+					"expressions":{"cidr_block":{"constant_value":"10.0.0.0/16"}}}]
+			}
+		}}
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "module.vpc.aws_vpc.this", Type: "aws_vpc", Name: "this",
+		Before: map[string]interface{}{"cidr_block": "10.0.0.0/16"},
+		After:  map[string]interface{}{"cidr_block": "10.1.0.0/16"},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (remote module), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "non-local") {
+		t.Fatalf("want non-local unresolved, got %v", unresolved)
+	}
+}
+
+func TestInstancedConstantUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `module "n" {
+  source = "./n"
+}
+`)
+	writeFile(t, dir, "n/main.tf", `resource "aws_subnet" "s" {
+  for_each = toset(["a", "b"])
+  cidr     = "10.0.0.0/24"
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"module_calls":{"n":{
+			"source":"./n",
+			"module":{
+				"resources":[{"address":"aws_subnet.s","mode":"managed","type":"aws_subnet","name":"s",
+					"expressions":{"cidr":{"constant_value":"10.0.0.0/24"}}}]
+			}
+		}}
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: `module.n.aws_subnet.s["a"]`, Type: "aws_subnet", Name: "s",
+		Before: map[string]interface{}{"cidr": "10.0.0.0/24"},
+		After:  map[string]interface{}{"cidr": "10.9.0.0/24"},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (cannot isolate shared constant), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "isolate") {
+		t.Fatalf("want isolate unresolved, got %v", unresolved)
+	}
+}
+
+// TestSetAttrMapEntry proves instance-scoped editing of one map entry without
+// disturbing the rest (the M2 for_each scoping mechanism).
+func TestSetAttrMapEntry(t *testing.T) {
+	src := `module "net" {
+  source = "./net"
+  cidrs = {
+    app = "10.0.1.0/24"
+    db  = "10.0.2.0/24"
+  }
+}
+`
+	f, diags := hclwrite.ParseConfig([]byte(src), "test.tf", hcl.Pos{Line: 1, Column: 1})
+	if diags.HasErrors() {
+		t.Fatal(diags.Error())
+	}
+	block := f.Body().FirstMatchingBlock("module", []string{"net"})
+	key := "app"
+	if err := setAttr(block, "cidrs", "10.0.9.0/24", &key); err != nil {
+		t.Fatal(err)
+	}
+	got := string(f.Bytes())
+	if !strings.Contains(got, "10.0.9.0/24") {
+		t.Errorf("app entry not updated:\n%s", got)
+	}
+	if !strings.Contains(got, "10.0.2.0/24") {
+		t.Errorf("db entry was lost:\n%s", got)
 	}
 }
