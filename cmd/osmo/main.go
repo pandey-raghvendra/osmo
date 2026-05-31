@@ -1,8 +1,7 @@
-// Command drift-resolver detects Terraform drift and proposes HCL changes that
-// make configuration follow real-world reality (the "absorb" direction).
+// Command osmo detects Terraform drift and proposes HCL changes that make
+// configuration follow real-world reality (the "absorb" direction).
 //
-// v1: prints a unified diff to stdout. It never writes files or applies changes
-// unless -write is passed.
+// Prints a unified diff to stdout by default. Pass -write to apply to disk.
 package main
 
 import (
@@ -17,11 +16,24 @@ import (
 	"github.com/raghav/osmo/internal/tfplan"
 )
 
+// Injected at build time by GoReleaser ldflags.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	dir := flag.String("dir", ".", "Terraform working directory")
 	bin := flag.String("terraform", "terraform", "Terraform binary to use")
 	write := flag.Bool("write", false, "Write absorbed changes to disk (default: diff only)")
+	ver := flag.Bool("version", false, "Print version and exit")
 	flag.Parse()
+
+	if *ver {
+		fmt.Printf("osmo %s (%s, %s)\n", version, commit[:min(7, len(commit))], date)
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
