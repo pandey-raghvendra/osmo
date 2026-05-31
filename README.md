@@ -168,8 +168,7 @@ osmo is **provider-agnostic**: it reads `terraform show -json` output and edits 
 
 ### Homebrew (macOS / Linux)
 ```sh
-brew tap pandey-raghvendra/osmo
-brew install osmo
+brew install pandey-raghvendra/osmo/osmo
 ```
 
 ### Go install
