@@ -53,7 +53,10 @@ func run(ctx context.Context, dir, bin string, write bool) error {
 	}
 
 	for _, c := range changes {
-		fmt.Printf("# %s  (attrs: %v)\n", c.Address, c.Attrs)
+		fmt.Printf("# %s\n", c.Path)
+		for _, e := range c.Edits {
+			fmt.Printf("#   %s  (attrs: %v)\n", e.Address, e.Attrs)
+		}
 		fmt.Print(diff.Unified(c.Path, c.Before, c.After))
 		if write {
 			if err := os.WriteFile(c.Path, c.After, 0o644); err != nil {

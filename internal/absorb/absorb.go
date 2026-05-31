@@ -17,46 +17,49 @@ import (
 	ctyjson "github.com/zclconf/go-cty/cty/json"
 )
 
-// FileChange is a proposed rewrite of one .tf file.
+// ResourceEdit records which attributes of one resource were rewritten.
+type ResourceEdit struct {
+	Address string   // resource address, e.g. "aws_instance.web"
+	Attrs   []string // attribute names rewritten (sorted)
+}
+
+// FileChange is a proposed rewrite of one .tf file. A single file may absorb
+// drift from multiple resources, recorded in Edits.
 type FileChange struct {
-	Path    string   // absolute path to the .tf file
-	Before  []byte   // original bytes
-	After   []byte   // rewritten bytes
-	Address string   // resource address that triggered the change
-	Attrs   []string // attribute names rewritten
+	Path   string         // absolute path to the .tf file
+	Before []byte         // original bytes
+	After  []byte         // rewritten bytes
+	Edits  []ResourceEdit // per-resource edits applied to this file
 }
 
 // Plan walks dir's .tf files and computes the HCL rewrites needed to absorb the
 // given drifts. v1 only rewrites attributes that already exist as literals in
 // the resource block AND changed between Before and After. Computed/read-only
 // attributes never in config are left untouched.
+//
+// Each file is parsed once and all matching drifts are applied to that single
+// in-memory AST before emitting one FileChange, so multiple drifted resources
+// sharing a file do not clobber each other's edits.
 func Plan(dir string, drifts []tfplan.Drift) ([]FileChange, error) {
 	tfFiles, err := filepath.Glob(filepath.Join(dir, "*.tf"))
 	if err != nil {
 		return nil, fmt.Errorf("glob tf files: %w", err)
 	}
 
-	var changes []FileChange
+	// Precompute changed attrs once per drift.
+	type pending struct {
+		drift   tfplan.Drift
+		changed map[string]interface{}
+	}
+	var todo []pending
 	for _, d := range drifts {
 		changed := changedAttrs(d.Before, d.After)
-		if len(changed) == 0 {
-			continue
-		}
-		fc, err := absorbResource(tfFiles, d, changed)
-		if err != nil {
-			return nil, err
-		}
-		if fc != nil {
-			changes = append(changes, *fc)
+		if len(changed) > 0 {
+			todo = append(todo, pending{d, changed})
 		}
 	}
-	return changes, nil
-}
 
-// absorbResource finds the HCL block for drift d across tfFiles and rewrites the
-// changed attributes that are present in the block. Returns nil if the block or
-// no matching attributes are found.
-func absorbResource(tfFiles []string, d tfplan.Drift, changed map[string]interface{}) (*FileChange, error) {
+	var changes []FileChange
 	for _, path := range tfFiles {
 		src, err := os.ReadFile(path)
 		if err != nil {
@@ -67,38 +70,52 @@ func absorbResource(tfFiles []string, d tfplan.Drift, changed map[string]interfa
 			return nil, fmt.Errorf("parse %s: %s", path, diags.Error())
 		}
 
-		block := f.Body().FirstMatchingBlock("resource", []string{d.Type, d.Name})
-		if block == nil {
-			continue
+		var edits []ResourceEdit
+		for _, p := range todo {
+			block := f.Body().FirstMatchingBlock("resource", []string{p.drift.Type, p.drift.Name})
+			if block == nil {
+				continue // resource not defined in this file
+			}
+			rewritten, err := applyAttrs(block, p.drift, p.changed)
+			if err != nil {
+				return nil, err
+			}
+			if len(rewritten) > 0 {
+				edits = append(edits, ResourceEdit{Address: p.drift.Address, Attrs: rewritten})
+			}
 		}
 
-		body := block.Body()
-		var rewritten []string
-		for name, val := range changed {
-			// Only touch attrs already written literally in config.
-			if body.GetAttribute(name) == nil {
-				continue
-			}
-			ctyVal, err := toCty(val)
-			if err != nil {
-				return nil, fmt.Errorf("%s.%s: %w", d.Address, name, err)
-			}
-			body.SetAttributeValue(name, ctyVal)
-			rewritten = append(rewritten, name)
+		if len(edits) > 0 {
+			changes = append(changes, FileChange{
+				Path:   path,
+				Before: src,
+				After:  f.Bytes(),
+				Edits:  edits,
+			})
 		}
-		if len(rewritten) == 0 {
-			return nil, nil
-		}
-		sort.Strings(rewritten)
-		return &FileChange{
-			Path:    path,
-			Before:  src,
-			After:   f.Bytes(),
-			Address: d.Address,
-			Attrs:   rewritten,
-		}, nil
 	}
-	return nil, nil
+	return changes, nil
+}
+
+// applyAttrs rewrites, in place, the changed attributes that are present as
+// literals in the block. Returns the sorted names of attributes rewritten.
+func applyAttrs(block *hclwrite.Block, d tfplan.Drift, changed map[string]interface{}) ([]string, error) {
+	body := block.Body()
+	var rewritten []string
+	for name, val := range changed {
+		// Only touch attrs already written literally in config.
+		if body.GetAttribute(name) == nil {
+			continue
+		}
+		ctyVal, err := toCty(val)
+		if err != nil {
+			return nil, fmt.Errorf("%s.%s: %w", d.Address, name, err)
+		}
+		body.SetAttributeValue(name, ctyVal)
+		rewritten = append(rewritten, name)
+	}
+	sort.Strings(rewritten)
+	return rewritten, nil
 }
 
 // changedAttrs returns top-level attributes whose value differs between before
