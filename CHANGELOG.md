@@ -11,6 +11,36 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.1.0] - 2026-06-01
+
+### Added
+- **`for_each` map-of-scalars (`each.value` direct)**: drift on resources using
+  `for_each = {a = "t3.micro"}` + `instance_type = each.value` now absorbed
+  automatically — single instance patched, siblings untouched.
+- **`for_each` map-of-objects (`each.value.X`)**: drift on resources using
+  `for_each = {a = {size = "t3.micro"}}` + `instance_type = each.value.size`
+  now absorbed automatically.
+- **`-debug` flag / `OSMO_DEBUG=1`**: prints debug trace to stderr — drift
+  addresses, absorb decisions, Unresolved reasons, verify plan results. Never
+  pollutes `-json` stdout.
+- **Terraform Cloud `-verify` auto-detection**: when `.terraform/terraform.tfstate`
+  shows a `remote` or `cloud` backend, `-verify` creates a speculative plan via
+  the TFC API (`TFE_TOKEN`) instead of running `terraform plan` locally.
+- **TFC tag-based workspace support**: `cloud {}` with `workspaces { tags = [...] }`
+  resolves workspace name from `.terraform/environment` (set by
+  `terraform workspace select`); clear error when name is not determinable.
+- **GitHub Actions drift workflow**: full example in README — schedules daily,
+  absorbs drift, opens a PR with diffs and unresolved summary.
+
+### Fixed
+- **`no_match` JSON `drift_count`**: was always `0` when `-target`/`-exclude`
+  filtered all drifted resources; now reports the actual pre-filter count.
+- **Windows CRLF line endings**: `.tf` files with `\r\n` endings now have their
+  line endings preserved after absorb — `hclwrite` output normalised to LF
+  before parse, restored to CRLF on emit.
+
+---
+
 ## [1.0.0] - 2026-06-01
 
 ### Added

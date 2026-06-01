@@ -98,15 +98,98 @@ osmo -dir ./infra -write -json > osmo.json
 
 ### GitHub Actions example
 
-```yaml
-- name: Absorb drift
-  id: osmo
-  run: osmo -dir ./infra -write -json > osmo.json; echo "exit=$?" >> $GITHUB_OUTPUT
+Full workflow — detects drift on a schedule, absorbs it, opens a PR, and posts a summary comment:
 
-- name: Open PR if drift absorbed
-  if: steps.osmo.outputs.exit == '2'
-  run: gh pr create --title "chore: absorb Terraform drift" --body "$(jq -r '.changes[].diff' osmo.json)"
+```yaml
+# .github/workflows/drift.yml
+name: Terraform drift absorption
+
+on:
+  schedule:
+    - cron: "0 6 * * *"   # daily at 06:00 UTC
+  workflow_dispatch:       # manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  absorb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1"
+          cli_config_credentials_token: ${{ secrets.TF_API_TOKEN }}
+
+      - name: Install osmo
+        run: |
+          brew install pandey-raghvendra/tap/osmo
+          # or: go install github.com/pandey-raghvendra/osmo/cmd/osmo@latest
+
+      - name: Terraform init
+        run: terraform init
+        working-directory: ./infra
+
+      - name: Absorb drift
+        id: osmo
+        run: |
+          osmo -dir ./infra -write -json > osmo.json
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Open PR for absorbed drift
+        if: steps.osmo.outputs.exit_code == '2'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="osmo/absorb-$(date +%Y%m%d-%H%M)"
+          git checkout -b "$BRANCH"
+          git config user.name  "osmo-bot"
+          git config user.email "osmo-bot@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: absorb Terraform drift $(date +%Y-%m-%d)"
+          git push origin "$BRANCH"
+
+          DRIFT_COUNT=$(jq '.drift_count' osmo.json)
+          SUMMARY=$(jq -r '
+            "## Drift absorbed\n\n" +
+            "**Resources drifted:** \(.drift_count)\n\n" +
+            (if (.unresolved | length) > 0
+             then "**Unresolved (\(.unresolved | length)):** " +
+                  ([.unresolved[] | "`\(.address).\(.attr)`: \(.reason)"] | join("\n")) + "\n\n"
+             else "" end) +
+            "### Diffs\n\n" +
+            ([.changes[] | "**`\(.path)`**\n```hcl\n\(.diff)\n```"] | join("\n\n"))
+          ' osmo.json)
+
+          gh pr create \
+            --title "chore: absorb Terraform drift ($DRIFT_COUNT resource(s))" \
+            --body "$SUMMARY" \
+            --label "terraform,drift"
+
+      - name: Post drift summary as step summary
+        if: always()
+        run: |
+          if [ -f osmo.json ]; then
+            echo "## osmo drift report" >> $GITHUB_STEP_SUMMARY
+            echo '```json' >> $GITHUB_STEP_SUMMARY
+            jq '{result, drift_count, unresolved_count: (.unresolved | length)}' osmo.json >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
 ```
+
+**Exit codes in CI:**
+
+| Code | Meaning | Action |
+|---|---|---|
+| `0` | No drift | Pass |
+| `1` | Error | Fail the job |
+| `2` | Drift found (changes proposed or written) | Open PR / notify |
 
 ---
 
@@ -226,7 +309,8 @@ you run terraform plan   → 0 diff = drift fully resolved
 | Scalar attr — literal | `instance_type = "t3.micro"` → `"t3.large"` | ✅ |
 | Scalar attr — `var.x` in module | root passes `size = 20`; resource uses `var.size` | ✅ |
 | Scalar attr — deep module chain | `module.a → module.b → resource` | ✅ |
-| Scalar attr — `for_each` scoped | one map entry updated, siblings intact | ✅ |
+| Scalar attr — `for_each` map-of-objects (`each.value.X`) | one map entry's attr updated, siblings intact | ✅ |
+| Scalar attr — `for_each` map-of-scalars (`each.value`) | scalar entry updated, siblings intact | ✅ |
 | Nested block attr — literal (any depth) | `ebs_block_device { volume_size = 20 }` | ✅ |
 | Nested block attr — `var.x` ref | `root_block_device { volume_size = var.size }` | ✅ |
 | Nested block add | new `ingress {}` block added out-of-band | ✅ |
@@ -245,7 +329,8 @@ Each unresolvable drift prints `! <address>.<attr>: <reason>`. Nothing is guesse
 | Pattern | Reason reported |
 |---|---|
 | `local.*` | locals not present in plan JSON |
-| `each.*` / `count.*` | meta-argument, not a literal |
+| `each.value.X` / `each.value` (scalar) | single-instance for_each map patched automatically — see above |
+| `each.key` / `count.*` | meta-argument derived from instance identity; cannot drift independently |
 | Composed expression (`"${var.a}-${var.b}"`) | multiple references |
 | Remote module constant | cannot edit registry/git source in place |
 | Shared constant across `for_each` instances | cannot isolate one instance |
@@ -311,33 +396,46 @@ Drift that added the 443 rule out-of-band causes osmo to update the `rules` list
 
 ## Terraform Cloud / Remote execution
 
-TFC remote execution does not allow saving local plan files (`-out` is unsupported). Use `-plan-json` to pass a pre-generated plan instead:
+### Auto-detection (recommended)
+
+osmo detects the TFC backend from `.terraform/terraform.tfstate` automatically. For drift detection, run `terraform init` first, then use `-plan-json` with a plan downloaded from TFC. For `-verify`, osmo creates a speculative plan via the TFC API — no extra flags needed:
 
 ```sh
-# 1. In TFC web UI: run a speculative refresh-only plan, then download the JSON
-#    Plans → <run> → Download JSON → save as plan.json
-#
-# OR via TFC API (requires TF_TOKEN_app_terraform_io):
-TFC_ORG=my-org
-TFC_WORKSPACE=my-workspace
-RUN_ID=$(curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
-  -H "Content-Type: application/vnd.api+json" \
-  -d '{"data":{"attributes":{"refresh-only":true,"plan-only":true},"type":"runs","relationships":{"workspace":{"data":{"type":"workspaces","id":"'$(
-    curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
-    "https://app.terraform.io/api/v2/organizations/$TFC_ORG/workspaces/$TFC_WORKSPACE" \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])"
-  )'"}}}}' \
-  https://app.terraform.io/api/v2/runs | python3 -c "import sys,json; print(json.load(sys.stdin)['data']['id'])")
-# poll until planned, then:
-curl -sS -H "Authorization: Bearer $TF_TOKEN_app_terraform_io" \
-  "https://app.terraform.io/api/v2/runs/$RUN_ID/plan/json-output" > plan.json
+export TFE_TOKEN=<your-team-token>   # standard Terraform env var
 
-# 2. Run osmo against your local .tf sources with the downloaded plan
-osmo -plan-json plan.json -dir ./infra
-osmo -plan-json plan.json -dir ./infra -write
+# Drift detection: pass a pre-generated plan JSON
+osmo -dir ./infra -plan-json plan.json
+
+# -verify: osmo auto-detects TFC and creates a speculative plan via API
+osmo -dir ./infra -plan-json plan.json -write -verify
 ```
 
-**If you use TFC only for remote state** (not remote execution), switch the workspace execution mode to **Local** — then `osmo -dir ./infra` works with no extra steps.
+**Tag-based workspace selection** (`cloud { workspaces { tags = [...] } }`): run `terraform workspace select <name>` first so osmo knows which workspace to use for verify.
+
+### Getting the plan JSON from TFC
+
+```sh
+# Option A: TFC web UI
+# Plans → <run> → Download JSON → save as plan.json
+
+# Option B: TFC API
+TFC_ORG=my-org
+TFC_WORKSPACE=my-workspace
+WS_ID=$(curl -sS -H "Authorization: Bearer $TFE_TOKEN" \
+  "https://app.terraform.io/api/v2/organizations/$TFC_ORG/workspaces/$TFC_WORKSPACE" \
+  | jq -r '.data.id')
+RUN_ID=$(curl -sS -H "Authorization: Bearer $TFE_TOKEN" \
+  -H "Content-Type: application/vnd.api+json" \
+  -d "{\"data\":{\"attributes\":{\"refresh-only\":true,\"plan-only\":true},\"type\":\"runs\",\"relationships\":{\"workspace\":{\"data\":{\"type\":\"workspaces\",\"id\":\"$WS_ID\"}}}}}" \
+  https://app.terraform.io/api/v2/runs | jq -r '.data.id')
+# poll until status = planned_and_finished, then:
+PLAN_ID=$(curl -sS -H "Authorization: Bearer $TFE_TOKEN" \
+  "https://app.terraform.io/api/v2/runs/$RUN_ID" | jq -r '.data.relationships.plan.data.id')
+curl -sS -H "Authorization: Bearer $TFE_TOKEN" \
+  "https://app.terraform.io/api/v2/plans/$PLAN_ID/json-output" > plan.json
+```
+
+**Local execution mode:** if you use TFC only for remote state (not remote execution), switch the workspace execution mode to **Local** — then `osmo -dir ./infra` works with no extra steps.
 
 ---
 
@@ -394,6 +492,17 @@ go build -o osmo ./cmd/osmo
 ---
 
 ## Troubleshooting
+
+**Enable debug output**
+
+```sh
+OSMO_DEBUG=1 osmo -dir ./infra
+# or: osmo -dir ./infra -debug
+```
+
+Debug output shows: how many resources drifted, which file each attribute resolved to, every Unresolved with its reason, and what the verify plan returned. Always include this output when filing a bug report.
+
+---
 
 **`terraform plan -refresh-only` fails inside osmo**
 
