@@ -20,6 +20,11 @@ import (
 	"time"
 )
 
+// httpClient is the shared HTTP client for all TFC API calls. The 30 s timeout
+// bounds individual request latency; context cancellation (Ctrl-C) still
+// terminates the call immediately if it fires first.
+var httpClient = &http.Client{Timeout: 30 * time.Second}
+
 // Backend holds TFC/TFE connection details extracted from the initialized
 // Terraform backend configuration.
 type Backend struct {
@@ -169,7 +174,7 @@ func (b *Backend) do(ctx context.Context, method, path string, body []byte, cont
 		req.Header.Set("Content-Type", "application/vnd.api+json")
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("TFC API %s %s: %w", method, path, err)
 	}
@@ -235,7 +240,7 @@ func (b *Backend) uploadTarball(ctx context.Context, uploadURL string, tarball [
 		return err
 	}
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("upload tarball: %w", err)
 	}

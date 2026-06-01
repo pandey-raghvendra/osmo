@@ -87,7 +87,100 @@ func TestFromGoValue(t *testing.T) {
 	}
 }
 
-func TestTFStateFrom(t *testing.T) {
+func TestTFValueAccessors(t *testing.T) {
+	// Kind
+	if TFStr("x").Kind() != TFString {
+		t.Error("Kind() wrong for string")
+	}
+	if TFNum(1).Kind() != TFNumber {
+		t.Error("Kind() wrong for number")
+	}
+	if TFBoolVal(true).Kind() != TFBool {
+		t.Error("Kind() wrong for bool")
+	}
+	if TFListVal(nil).Kind() != TFList {
+		t.Error("Kind() wrong for list")
+	}
+	if TFObjectVal(nil).Kind() != TFObject {
+		t.Error("Kind() wrong for object")
+	}
+	if (TFValue{}).Kind() != TFNull {
+		t.Error("Kind() wrong for null")
+	}
+
+	// IsNull / IsList
+	zeroVal := TFValue{}
+	if !zeroVal.IsNull() {
+		t.Error("IsNull should be true for zero value")
+	}
+	if TFStr("x").IsNull() {
+		t.Error("IsNull should be false for string")
+	}
+	if !TFListVal(nil).IsList() {
+		t.Error("IsList should be true for list")
+	}
+	if TFStr("x").IsList() {
+		t.Error("IsList should be false for string")
+	}
+
+	// AsBool
+	b, ok := TFBoolVal(true).AsBool()
+	if !ok || !b {
+		t.Error("AsBool(true) failed")
+	}
+	_, ok = TFStr("x").AsBool()
+	if ok {
+		t.Error("AsBool on string should fail")
+	}
+
+	// AsList
+	items := []TFValue{TFStr("a"), TFStr("b")}
+	list, ok := TFListVal(items).AsList()
+	if !ok || len(list) != 2 {
+		t.Error("AsList failed")
+	}
+	_, ok = TFStr("x").AsList()
+	if ok {
+		t.Error("AsList on string should fail")
+	}
+
+	// AsObject
+	obj := map[string]TFValue{"k": TFStr("v")}
+	got, ok := TFObjectVal(obj).AsObject()
+	if !ok || !got["k"].Equal(TFStr("v")) {
+		t.Error("AsObject failed")
+	}
+	_, ok = TFStr("x").AsObject()
+	if ok {
+		t.Error("AsObject on string should fail")
+	}
+}
+
+func TestTFValueMarshalJSON(t *testing.T) {
+	cases := []struct {
+		val  TFValue
+		want string
+	}{
+		{TFValue{}, "null"},
+		{TFStr("hello"), `"hello"`},
+		{TFNum(42), "42"},
+		{TFBoolVal(true), "true"},
+		{TFBoolVal(false), "false"},
+		{TFListVal([]TFValue{TFStr("a")}), `["a"]`},
+		{TFObjectVal(TFState{"k": TFStr("v")}), `{"k":"v"}`},
+	}
+	for _, c := range cases {
+		b, err := json.Marshal(c.val)
+		if err != nil {
+			t.Fatalf("Marshal(%v): %v", c.val, err)
+		}
+		if string(b) != c.want {
+			t.Errorf("Marshal(%v) = %q, want %q", c.val, b, c.want)
+		}
+	}
+}
+
+func TestTFValueStateFrom(t *testing.T) {
 	m := map[string]interface{}{
 		"size": float64(20),
 		"type": "gp2",

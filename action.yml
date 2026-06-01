@@ -1,0 +1,115 @@
+name: 'osmo'
+description: 'Detect Terraform/OpenTofu drift and rewrite .tf files to match real-world state (absorb direction)'
+author: 'Raghvendra Pandey'
+
+branding:
+  icon: 'refresh-cw'
+  color: 'blue'
+
+inputs:
+  dir:
+    description: 'Terraform/OpenTofu working directory'
+    required: false
+    default: '.'
+  write:
+    description: 'Write absorbed changes to disk (false = dry-run diff only)'
+    required: false
+    default: 'false'
+  verify:
+    description: 'After writing, run plan and roll back if drift remains (requires write=true)'
+    required: false
+    default: 'false'
+  json:
+    description: 'Emit JSON output; saves to osmo-output.json and sets output variables'
+    required: false
+    default: 'false'
+  target:
+    description: 'Only absorb this resource address (comma-separated; repeatable)'
+    required: false
+    default: ''
+  exclude:
+    description: 'Skip this resource address (comma-separated; takes precedence over target)'
+    required: false
+    default: ''
+  plan_json:
+    description: 'Path to a pre-generated terraform/tofu show -json file (skips live detection)'
+    required: false
+    default: ''
+  version:
+    description: 'osmo release tag to install (e.g. v1.1.0). Defaults to latest.'
+    required: false
+    default: 'latest'
+  terraform_binary:
+    description: 'Explicit path to the terraform or tofu binary. When unset, osmo auto-detects.'
+    required: false
+    default: ''
+
+outputs:
+  result:
+    description: 'osmo result string: no_drift | no_match | proposed | absorbed | nothing_absorbable | verify_failed | error'
+    value: ${{ steps.osmo.outputs.result }}
+  drift_count:
+    description: 'Number of drifted resources detected'
+    value: ${{ steps.osmo.outputs.drift_count }}
+  exit_code:
+    description: 'osmo exit code (0=no drift, 1=error, 2=drift found)'
+    value: ${{ steps.osmo.outputs.exit_code }}
+  json_path:
+    description: 'Path to osmo-output.json (only set when json=true)'
+    value: ${{ steps.osmo.outputs.json_path }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install osmo
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(curl -sSfL \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/pandey-raghvendra/osmo/releases/latest \
+            | grep '"tag_name"' | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+        fi
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64)        ARCH="amd64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+        esac
+        ASSET="osmo_${VERSION#v}_${OS}_${ARCH}.tar.gz"
+        URL="https://github.com/pandey-raghvendra/osmo/releases/download/${VERSION}/${ASSET}"
+        echo "Installing osmo ${VERSION} from ${URL}"
+        curl -sSfL "$URL" | tar -xz -C /usr/local/bin osmo
+        chmod +x /usr/local/bin/osmo
+        osmo -version
+
+    - name: Run osmo
+      id: osmo
+      shell: bash
+      run: |
+        ARGS=""
+        ARGS="$ARGS -dir ${{ inputs.dir }}"
+        [ "${{ inputs.write }}"   = "true" ] && ARGS="$ARGS -write"
+        [ "${{ inputs.verify }}"  = "true" ] && ARGS="$ARGS -verify"
+        [ -n "${{ inputs.target }}" ]        && ARGS="$ARGS -target ${{ inputs.target }}"
+        [ -n "${{ inputs.exclude }}" ]       && ARGS="$ARGS -exclude ${{ inputs.exclude }}"
+        [ -n "${{ inputs.plan_json }}" ]     && ARGS="$ARGS -plan-json ${{ inputs.plan_json }}"
+        [ -n "${{ inputs.terraform_binary }}" ] && export OSMO_TF_BINARY="${{ inputs.terraform_binary }}"
+
+        if [ "${{ inputs.json }}" = "true" ]; then
+          osmo $ARGS -json > osmo-output.json
+          EXIT_CODE=$?
+          RESULT=$(jq -r '.result'      osmo-output.json 2>/dev/null || echo "error")
+          DRIFT=$(jq -r  '.drift_count' osmo-output.json 2>/dev/null || echo "0")
+          echo "result=${RESULT}"      >> "$GITHUB_OUTPUT"
+          echo "drift_count=${DRIFT}"  >> "$GITHUB_OUTPUT"
+          echo "json_path=osmo-output.json" >> "$GITHUB_OUTPUT"
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
+        else
+          osmo $ARGS
+          EXIT_CODE=$?
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+          exit $EXIT_CODE
+        fi

@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 
@@ -73,14 +74,27 @@ func main() {
 		return
 	}
 
+	// Track which flags were explicitly set by the user.
+	set := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+
 	// Load .osmo.json from the working dir (which may still be "." at this
 	// point) and apply config defaults for flags the user did not set.
 	if cfg, err := blockid.LoadConfig(*dir); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: could not load .osmo.json:", err)
 	} else {
-		set := map[string]bool{}
-		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
 		applyConfigDefaults(cfg, set, dir, bin, write, verify, jsonOut, &targets, &excludes)
+	}
+
+	// Resolve the Terraform-compatible binary.
+	// Priority: OSMO_TF_BINARY env > -terraform flag > .osmo.json default > auto-detect (tofu → terraform).
+	if envBin := os.Getenv("OSMO_TF_BINARY"); envBin != "" {
+		*bin = envBin
+	} else if !set["terraform"] && *bin == "terraform" {
+		// Neither flag nor .osmo.json set a binary: prefer tofu when installed.
+		if _, err := exec.LookPath("tofu"); err == nil {
+			*bin = "tofu"
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)

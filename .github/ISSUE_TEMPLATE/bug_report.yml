@@ -1,0 +1,67 @@
+name: Bug report
+description: Something is wrong or osmo produced an incorrect result
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: run with `OSMO_DEBUG=1` and include the debug output below.
+
+  - type: input
+    id: version
+    attributes:
+      label: osmo version
+      description: Output of `osmo -version`
+    validations:
+      required: true
+
+  - type: input
+    id: tf_version
+    attributes:
+      label: Terraform / OpenTofu version
+      description: Output of `terraform version` or `tofu version`
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS / arch
+      placeholder: e.g. macOS 14, linux/amd64
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command run
+      placeholder: osmo -dir ./infra -write -json
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour (include OSMO_DEBUG=1 output)
+    validations:
+      required: true
+
+  - type: textarea
+    id: tf_snippet
+    attributes:
+      label: Minimal .tf snippet (redact real resource IDs / credentials)
+      render: hcl
+
+  - type: textarea
+    id: plan_json
+    attributes:
+      label: Relevant resource_drift from terraform show -json (redact credentials)
+      description: Only the drifted resource's entry is needed. Wrap in a <details> block if large.
+      render: json

@@ -48,7 +48,7 @@ osmo -dir ./infra -write -verify
 | Flag | Default | Meaning |
 |---|---|---|
 | `-dir` | `.` | Terraform working directory |
-| `-terraform` | `terraform` | Terraform binary path |
+| `-terraform` | auto-detect | Terraform/OpenTofu binary path (auto-detects `tofu` then `terraform`; overridden by `OSMO_TF_BINARY` env) |
 | `-write` | `false` | Write changes to disk (else dry-run diff only) |
 | `-verify` | `false` | After writing, run a normal plan; roll back files if any absorbed resource still has a planned change (requires `-write`; not usable with `-plan-json`) |
 | `-approve` | `false` | Interactively approve each file change before writing (requires `-write` and a TTY) |
@@ -56,6 +56,30 @@ osmo -dir ./infra -write -verify
 | `-target` | `` | Only absorb drift on this resource address (repeatable / comma-separated) |
 | `-exclude` | `` | Skip drift on this resource address (repeatable / comma-separated; wins over `-target`) |
 | `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
+
+## OpenTofu support
+
+osmo is compatible with both Terraform and OpenTofu. Binary selection priority:
+
+1. `OSMO_TF_BINARY` env var — always wins
+2. `-terraform` CLI flag
+3. `.osmo.json` `defaults.terraform` field
+4. Auto-detect: `tofu` if found on `PATH`, otherwise `terraform`
+
+```sh
+# Explicit: use tofu
+osmo -dir ./infra -terraform tofu
+
+# Env var (useful in CI)
+OSMO_TF_BINARY=tofu osmo -dir ./infra
+
+# Auto-detect: no flags needed if tofu is on PATH
+osmo -dir ./infra
+```
+
+All flags, `-verify`, `-json`, and Terraform Cloud support work identically with OpenTofu.
+
+---
 
 ## Exit codes
 
@@ -441,18 +465,20 @@ curl -sS -H "Authorization: Bearer $TFE_TOKEN" \
 
 ## Provider support
 
-osmo is **provider-agnostic**: it reads `terraform show -json` output and edits HCL. Any provider whose resources appear in `resource_drift[]` is supported. Tested against:
+osmo is **provider-agnostic**: it reads `terraform show -json` (or `tofu show -json`) output and edits HCL. Any provider whose resources appear in `resource_drift[]` is supported. Tested against:
 
 - AWS (`aws_*`)
 - Azure (`azurerm_*`)
 - Custom local modules
+
+Works with both Terraform and OpenTofu — see [OpenTofu support](#opentofu-support).
 
 ---
 
 ## Requirements
 
 - Go 1.21+ (to build from source)
-- Terraform ≥ 1.0 (for `show -json` with `resource_drift`)
+- Terraform ≥ 1.0 **or** OpenTofu ≥ 1.6 (for `show -json` with `resource_drift`)
 
 ---
 
@@ -475,6 +501,19 @@ cd osmo
 go build -o osmo ./cmd/osmo
 ```
 
+### GitHub Actions
+
+```yaml
+- uses: pandey-raghvendra/osmo@v1
+  with:
+    dir: ./infra
+    write: 'true'
+    json: 'true'
+  # outputs: result, drift_count, exit_code, json_path
+```
+
+All flags are available as inputs. `OSMO_TF_BINARY` is set automatically when you pass `terraform_binary: tofu`. See [`action.yml`](action.yml) for the full input/output reference.
+
 ---
 
 ## Known limitations
@@ -486,7 +525,7 @@ go build -o osmo ./cmd/osmo
 | `dynamic` + map `for_each` | map reconstruction from expanded blocks not supported |
 | Out-of-band *created* resources | resources that exist in Azure/AWS but not in config are invisible to `resource_drift` — use `terraform import` then osmo |
 | Module arg / var default deletion | when a removed attr traces through a module arg or variable default, osmo reports it unresolved; only resource-block literals are auto-removed |
-| Terraform Cloud remote execution | `-verify` requires local plan execution; not supported on TFC remote runs |
+| Terraform Cloud remote execution | `-verify` uses the TFC API (speculative plan); `-plan-json` mode requires downloading the plan JSON from TFC first |
 | Windows line endings | `hclwrite` outputs LF; files with CRLF line endings may show larger diffs |
 
 ---

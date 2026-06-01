@@ -1,0 +1,44 @@
+name: Feature request
+description: Propose a new drift pattern, flag, or capability
+labels: ["enhancement"]
+body:
+  - type: dropdown
+    id: category
+    attributes:
+      label: Category
+      options:
+        - New drift pattern (currently reported as unresolved)
+        - New block identity key
+        - New CLI flag / option
+        - OpenTofu compatibility
+        - CI / packaging
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What drift pattern is not handled today?
+      description: Paste the unresolved message osmo prints, or describe what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: tf_snippet
+    attributes:
+      label: Minimal .tf snippet showing the pattern
+      render: hcl
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behaviour
+      description: What should osmo do instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
