@@ -1,5 +1,5 @@
 name: 'osmo – Terraform/OpenTofu Drift Absorber'
-description: 'Detect drift and rewrite .tf files to match real-world state. Triage by risk (SAFE/REVIEW/FLAG), absorb selectively, verify convergence.'
+description: 'Absorb Terraform/OpenTofu drift — rewrite .tf files to match reality. Risk triage, selective absorb, convergence verify.'
 author: 'Raghvendra Pandey'
 
 branding:
