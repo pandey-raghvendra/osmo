@@ -1,3 +1,5 @@
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/8340088e-2b5b-45bd-a13c-066a5c1821aa" />
+
 <p align="center">
   <a href="https://github.com/pandey-raghvendra/osmo/stargazers">
     <img src="https://img.shields.io/github/stars/pandey-raghvendra/osmo?style=social" alt="GitHub Stars"/>
