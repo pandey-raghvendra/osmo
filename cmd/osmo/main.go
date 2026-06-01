@@ -22,6 +22,7 @@ import (
 	"github.com/pandey-raghvendra/osmo/internal/blockid"
 	"github.com/pandey-raghvendra/osmo/internal/diff"
 	"github.com/pandey-raghvendra/osmo/internal/provenance"
+	"github.com/pandey-raghvendra/osmo/internal/tfc"
 	"github.com/pandey-raghvendra/osmo/internal/tfplan"
 )
 
@@ -415,11 +416,29 @@ func writeChanges(changes []absorb.FileChange) ([]absorb.FileChange, error) {
 	return written, nil
 }
 
+// plannedChangesForVerify returns the resource addresses Terraform would still
+// act on after absorb. It uses TFC API when a remote/cloud backend is detected
+// (local terraform plan is unavailable in that case); otherwise runs locally.
+func plannedChangesForVerify(ctx context.Context, o runOpts) ([]string, error) {
+	b, err := tfc.DetectBackend(o.dir)
+	if err != nil {
+		// Detection error (TFE_TOKEN missing, etc.) — surface it.
+		return nil, fmt.Errorf("TFC backend detected: %w", err)
+	}
+	if b != nil {
+		if !o.jsonOut {
+			fmt.Fprintf(os.Stderr, "TFC backend detected (%s) — using speculative plan via API\n", b.WorkspaceURL())
+		}
+		return b.PlannedChanges(ctx, o.dir)
+	}
+	return tfplan.PlannedChanges(ctx, o.dir, o.bin)
+}
+
 func verifyAndMaybeRollback(ctx context.Context, o runOpts, written []absorb.FileChange) error {
 	if !o.jsonOut {
 		fmt.Fprintln(os.Stderr, "verifying (terraform plan)...")
 	}
-	actionable, err := tfplan.PlannedChanges(ctx, o.dir, o.bin)
+	actionable, err := plannedChangesForVerify(ctx, o)
 	if err != nil {
 		if rbErr := rollback(written); rbErr != nil {
 			return fmt.Errorf("verify plan failed (%v) and rollback failed: %w", err, rbErr)
