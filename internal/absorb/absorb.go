@@ -74,6 +74,18 @@ type BlockAttrEdit struct {
 	Value     interface{}
 }
 
+// BlockAttrRemove is a leaf-level scalar attribute removal inside a nested
+// block. It is emitted when refreshed reality no longer has an attribute that
+// prior state had.
+type BlockAttrRemove struct {
+	DriftAddr string
+	ResType   string
+	ResName   string
+	ResMode   string
+	Steps     []BlockStep
+	Attr      string
+}
+
 // BlockStructuralChange is a nested block count change (add or remove) at some
 // nesting depth. Steps is the path to the parent body; Added and Removed are
 // the after- and before-attribute maps of the affected block instances.
@@ -99,8 +111,8 @@ type DynamicBlockUpdate struct {
 	ResType   string
 	ResName   string
 	ResMode   string
-	Steps     []BlockStep             // path to the body containing the dynamic block
-	BlockType string                  // the dynamic block's label, e.g. "ingress"
+	Steps     []BlockStep              // path to the body containing the dynamic block
+	BlockType string                   // the dynamic block's label, e.g. "ingress"
 	AfterFull []map[string]interface{} // complete after-state of this block type
 }
 
@@ -127,6 +139,10 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		addr address.Addr
 		edit BlockAttrEdit
 	}
+	type nestedAttrRemoveOp struct {
+		addr   address.Addr
+		remove BlockAttrRemove
+	}
 	type nestedStructOp struct {
 		addr   address.Addr
 		change BlockStructuralChange
@@ -134,6 +150,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 
 	var scalarOps []scalarOp
 	var nestedAttrOps []nestedAttrOp
+	var nestedAttrRemoveOps []nestedAttrRemoveOp
 	var nestedStructOps []nestedStructOp
 
 	type dynUpdateOp struct {
@@ -190,9 +207,13 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		// BlockAttrEdits for nested literals, BlockStructuralChanges for
 		// count-change events, and DynamicBlockUpdates for every slice attr
 		// (used if the block type is implemented with a `dynamic` block).
-		blockEdits, blockStructs, blockDynUpdates := walkDriftMap(addr, d.Address, nil, d.Before, d.After)
+		blockEdits, blockRemoves, blockStructs, blockDynUpdates, blockUnresolved := walkDriftMap(addr, d.Address, nil, d.Before, d.After, d.AfterSensitive)
+		unresolved = append(unresolved, blockUnresolved...)
 		for _, e := range blockEdits {
 			nestedAttrOps = append(nestedAttrOps, nestedAttrOp{addr, e})
+		}
+		for _, r := range blockRemoves {
+			nestedAttrRemoveOps = append(nestedAttrRemoveOps, nestedAttrRemoveOp{addr, r})
 		}
 		for _, s := range blockStructs {
 			nestedStructOps = append(nestedStructOps, nestedStructOp{addr, s})
@@ -298,6 +319,32 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		}
 		if path != "" {
 			record(path, o.edit.DriftAddr, qualAttr)
+		}
+	}
+
+	// Nested attr removals: remove literal/configured attrs that disappeared
+	// from refreshed reality.
+	for _, o := range nestedAttrRemoveOps {
+		dir, err := resolveDir(root, baseDir, o.addr.Modules)
+		if err != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.remove.DriftAddr,
+				Attr:    qualifiedAttr(o.remove.Steps, o.remove.Attr),
+				Reason:  err.Error(),
+			})
+			continue
+		}
+		de, err := getEditor(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		path, qualAttr, u := de.applyBlockAttrRemove(o.remove)
+		if u != nil {
+			unresolved = append(unresolved, *u)
+			continue
+		}
+		if path != "" {
+			record(path, o.remove.DriftAddr, qualAttr)
 		}
 	}
 
@@ -410,6 +457,11 @@ func changedAttrs(before, after map[string]interface{}) map[string]interface{} {
 	for k, av := range after {
 		if bv, ok := before[k]; !ok || !reflect.DeepEqual(bv, av) {
 			changed[k] = av
+		}
+	}
+	for k := range before {
+		if _, ok := after[k]; !ok {
+			changed[k] = nil
 		}
 	}
 	return changed
@@ -541,6 +593,7 @@ func setAttr(block *hclwrite.Block, attr string, value interface{}, key *string)
 
 // walkDriftMap recursively walks a before/after map pair and emits:
 //   - BlockAttrEdits for scalar attr changes INSIDE nested blocks (path != nil)
+//   - BlockAttrRemoves for scalar attrs removed from refreshed nested blocks
 //   - BlockStructuralChanges for nested block count changes at any depth
 //   - DynamicBlockUpdates for every slice attr (used if the block type is a
 //     Terraform `dynamic` block; no-op otherwise)
@@ -552,16 +605,32 @@ func walkDriftMap(
 	driftAddr string,
 	path []BlockStep,
 	before, after map[string]interface{},
-) (edits []BlockAttrEdit, structs []BlockStructuralChange, dynUpdates []DynamicBlockUpdate) {
+	afterSensitive interface{},
+) (edits []BlockAttrEdit, removes []BlockAttrRemove, structs []BlockStructuralChange, dynUpdates []DynamicBlockUpdate, unresolved []provenance.Unresolved) {
 	for k, av := range after {
 		bv := before[k]
 		if reflect.DeepEqual(bv, av) {
 			continue
 		}
+		qualAttr := qualifiedAttr(path, k)
 		afterSlice, isSlice := av.([]interface{})
 		if !isSlice {
 			if len(path) == 0 {
 				// Root-level scalar: handled via provenance in Plan.
+				continue
+			}
+			if av == nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: driftAddr, Attr: qualAttr,
+					Reason: "after value is null (attribute removed in reality); removal from config not supported automatically",
+				})
+				continue
+			}
+			if isSensitiveNested(afterSensitive, k) {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: driftAddr, Attr: qualAttr,
+					Reason: "sensitive value — cannot absorb into plain-text config",
+				})
 				continue
 			}
 			// Nested scalar attr change.
@@ -581,9 +650,102 @@ func walkDriftMap(
 		beforeSlice, _ := bv.([]interface{})
 		bMaps := toMapSlice(beforeSlice)
 		aMaps := toMapSlice(afterSlice)
+		sensitiveElems := sensitiveSlice(afterSensitive, k)
 
-		// Always emit a DynamicBlockUpdate for the full after collection.
-		// applyDynamicBlockUpdate is a no-op for literal (non-dynamic) blocks.
+		if hasSensitiveValue(sensitiveElems) {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: driftAddr, Attr: qualAttr + ".for_each",
+				Reason: "sensitive value — cannot absorb dynamic block collection into plain-text config",
+			})
+		} else {
+			// Always emit a DynamicBlockUpdate for the full after collection.
+			// applyDynamicBlockUpdate is a no-op for literal (non-dynamic) blocks.
+			dynUpdates = append(dynUpdates, DynamicBlockUpdate{
+				DriftAddr: driftAddr,
+				ResType:   addr.Type,
+				ResName:   addr.Name,
+				ResMode:   addr.Mode,
+				Steps:     path,
+				BlockType: k,
+				AfterFull: aMaps,
+			})
+		}
+
+		// Match before↔after pairs by identity/similarity even when counts are
+		// equal. Terraform providers commonly model nested blocks as sets; Azure
+		// Application Gateway is a practical example where positional matching
+		// turns delete/create drift into misleading scalar edits.
+		matches, addedIdx, removedIdx, matchErr := matchBlockElements(addr.Type, blockPath(path, k), bMaps, aMaps)
+		if matchErr != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: driftAddr, Attr: qualAttr,
+				Reason: matchErr.Error(),
+			})
+			continue
+		}
+		if len(addedIdx) > 0 || len(removedIdx) > 0 {
+			var added, removed []map[string]interface{}
+			for _, i := range addedIdx {
+				if hasSensitiveValue(sensitiveAt(sensitiveElems, i)) {
+					unresolved = append(unresolved, provenance.Unresolved{
+						Address: driftAddr, Attr: qualAttr,
+						Reason: "sensitive value in added block — cannot absorb into plain-text config",
+					})
+					continue
+				}
+				added = append(added, aMaps[i])
+			}
+			for _, i := range removedIdx {
+				removed = append(removed, bMaps[i])
+			}
+			structs = append(structs, BlockStructuralChange{
+				DriftAddr: driftAddr,
+				ResType:   addr.Type,
+				ResName:   addr.Name,
+				ResMode:   addr.Mode,
+				Steps:     path,
+				BlockType: k,
+				Added:     added,
+				Removed:   removed,
+			})
+		}
+		for _, pair := range matches {
+			bm, am := bMaps[pair[0]], aMaps[pair[1]]
+			drifted := changedAttrs(bm, am)
+			if len(drifted) == 0 {
+				continue
+			}
+			newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
+			newPath := append(append([]BlockStep(nil), path...), newStep)
+			subEdits, subRemoves, subStructs, subDyn, subUnresolved := walkDriftMap(addr, driftAddr, newPath, bm, am, sensitiveAt(sensitiveElems, pair[1]))
+			edits = append(edits, subEdits...)
+			removes = append(removes, subRemoves...)
+			structs = append(structs, subStructs...)
+			dynUpdates = append(dynUpdates, subDyn...)
+			unresolved = append(unresolved, subUnresolved...)
+		}
+	}
+	for k, bv := range before {
+		if _, ok := after[k]; ok {
+			continue
+		}
+		if len(path) == 0 {
+			// Root-level removals are not edited automatically.
+			continue
+		}
+		beforeSlice, isSlice := bv.([]interface{})
+		if !isSlice {
+			removes = append(removes, BlockAttrRemove{
+				DriftAddr: driftAddr,
+				ResType:   addr.Type,
+				ResName:   addr.Name,
+				ResMode:   addr.Mode,
+				Steps:     path,
+				Attr:      k,
+			})
+			continue
+		}
+		bMaps := toMapSlice(beforeSlice)
 		dynUpdates = append(dynUpdates, DynamicBlockUpdate{
 			DriftAddr: driftAddr,
 			ResType:   addr.Type,
@@ -591,63 +753,17 @@ func walkDriftMap(
 			ResMode:   addr.Mode,
 			Steps:     path,
 			BlockType: k,
-			AfterFull: aMaps,
+			AfterFull: nil,
 		})
-
-		if len(bMaps) == len(aMaps) {
-			// Same count: blocks are the same logical instances with drifted
-			// attrs. Match positionally — no structural change.
-			for i := range aMaps {
-				bm, am := bMaps[i], aMaps[i]
-				drifted := changedAttrs(bm, am)
-				if len(drifted) == 0 {
-					continue
-				}
-				newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
-				newPath := append(append([]BlockStep(nil), path...), newStep)
-				subEdits, subStructs, subDyn := walkDriftMap(addr, driftAddr, newPath, bm, am)
-				edits = append(edits, subEdits...)
-				structs = append(structs, subStructs...)
-				dynUpdates = append(dynUpdates, subDyn...)
-			}
-		} else {
-			// Different count: some blocks were added or removed out-of-band.
-			// Use greedy scoring to match before↔after pairs, then report
-			// structural changes and recurse into matched pairs for attr diffs.
-			matches, addedIdx, removedIdx := matchBlockElements(bMaps, aMaps)
-			if len(addedIdx) > 0 || len(removedIdx) > 0 {
-				var added, removed []map[string]interface{}
-				for _, i := range addedIdx {
-					added = append(added, aMaps[i])
-				}
-				for _, i := range removedIdx {
-					removed = append(removed, bMaps[i])
-				}
-				structs = append(structs, BlockStructuralChange{
-					DriftAddr: driftAddr,
-					ResType:   addr.Type,
-					ResName:   addr.Name,
-					ResMode:   addr.Mode,
-					Steps:     path,
-					BlockType: k,
-					Added:     added,
-					Removed:   removed,
-				})
-			}
-			for _, pair := range matches {
-				bm, am := bMaps[pair[0]], aMaps[pair[1]]
-				drifted := changedAttrs(bm, am)
-				if len(drifted) == 0 {
-					continue
-				}
-				newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
-				newPath := append(append([]BlockStep(nil), path...), newStep)
-				subEdits, subStructs, subDyn := walkDriftMap(addr, driftAddr, newPath, bm, am)
-				edits = append(edits, subEdits...)
-				structs = append(structs, subStructs...)
-				dynUpdates = append(dynUpdates, subDyn...)
-			}
-		}
+		structs = append(structs, BlockStructuralChange{
+			DriftAddr: driftAddr,
+			ResType:   addr.Type,
+			ResName:   addr.Name,
+			ResMode:   addr.Mode,
+			Steps:     path,
+			BlockType: k,
+			Removed:   bMaps,
+		})
 	}
 	return
 }
@@ -655,20 +771,33 @@ func walkDriftMap(
 // matchBlockElements greedily matches before elements to after elements by
 // attribute similarity, returning matched index pairs, unmatched after indices
 // (added), and unmatched before indices (removed).
-func matchBlockElements(before, after []map[string]interface{}) (matches [][2]int, added, removed []int) {
+func matchBlockElements(resourceType string, path []string, before, after []map[string]interface{}) (matches [][2]int, added, removed []int, err error) {
+	if len(before) == 1 && len(after) == 1 && !hasDifferentNameIdentity(before[0], after[0]) {
+		return [][2]int{{0, 0}}, nil, nil, nil
+	}
+	identity := identityKeys(resourceType, path)
 	used := make([]bool, len(after))
 	for bi, bm := range before {
 		bestScore, bestAi := -1, -1
+		ties := 0
 		for ai, am := range after {
 			if used[ai] {
 				continue
 			}
-			if s := mapMatchScore(bm, am); s > bestScore {
+			s := mapMatchScore(bm, am, identity)
+			switch {
+			case s > bestScore:
 				bestScore, bestAi = s, ai
+				ties = 1
+			case s == bestScore:
+				ties++
 			}
 		}
 		// Accept the match only if at least one key matches.
 		if bestAi >= 0 && bestScore > 0 {
+			if ties > 1 {
+				return nil, nil, nil, fmt.Errorf("ambiguous nested block collection match: before element %d matched multiple after elements equally", bi)
+			}
 			matches = append(matches, [2]int{bi, bestAi})
 			used[bestAi] = true
 		} else {
@@ -684,7 +813,13 @@ func matchBlockElements(before, after []map[string]interface{}) (matches [][2]in
 }
 
 // mapMatchScore counts keys with equal values between two maps (deep equal).
-func mapMatchScore(a, b map[string]interface{}) int {
+func mapMatchScore(a, b map[string]interface{}, identity []string) int {
+	if len(identity) > 0 {
+		return identityMatchScore(a, b, identity)
+	}
+	if hasDifferentNameIdentity(a, b) {
+		return 0
+	}
 	score := 0
 	for k, av := range a {
 		if bv, ok := b[k]; ok && reflect.DeepEqual(av, bv) {
@@ -692,6 +827,80 @@ func mapMatchScore(a, b map[string]interface{}) int {
 		}
 	}
 	return score
+}
+
+func identityMatchScore(a, b map[string]interface{}, keys []string) int {
+	score := 0
+	for _, k := range keys {
+		av, aOK := a[k]
+		bv, bOK := b[k]
+		if !aOK || !bOK {
+			continue
+		}
+		if !reflect.DeepEqual(av, bv) {
+			return 0
+		}
+		score += 100
+	}
+	if score == 0 {
+		return mapMatchScore(a, b, nil)
+	}
+	return score
+}
+
+func hasDifferentNameIdentity(a, b map[string]interface{}) bool {
+	av, aOK := a["name"]
+	bv, bOK := b["name"]
+	return aOK && bOK && !reflect.DeepEqual(av, bv)
+}
+
+func identityKeys(resourceType string, path []string) []string {
+	if resourceType == "azurerm_application_gateway" && len(path) > 0 {
+		switch path[len(path)-1] {
+		case "backend_address_pool",
+			"backend_http_settings",
+			"frontend_ip_configuration",
+			"frontend_port",
+			"gateway_ip_configuration",
+			"http_listener",
+			"probe",
+			"redirect_configuration",
+			"request_routing_rule",
+			"rewrite_rule_set",
+			"ssl_certificate",
+			"trusted_root_certificate",
+			"url_path_map":
+			return []string{"name"}
+		}
+	}
+	return nil
+}
+
+func canAddMissingNestedAttr(edit BlockAttrEdit) bool {
+	path := blockPath(edit.Steps, "")
+	if len(path) > 0 && path[len(path)-1] == "" {
+		path = path[:len(path)-1]
+	}
+	if edit.ResType == "azurerm_application_gateway" && len(path) > 0 {
+		switch path[len(path)-1] {
+		case "backend_http_settings":
+			return edit.Attr == "probe_name"
+		case "url_path_map", "path_rule":
+			switch edit.Attr {
+			case "backend_address_pool_name", "backend_http_settings_name", "redirect_configuration_name", "rewrite_rule_set_name":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func blockPath(steps []BlockStep, next string) []string {
+	path := make([]string, 0, len(steps)+1)
+	for _, s := range steps {
+		path = append(path, s.BlockType)
+	}
+	return append(path, next)
 }
 
 func toMapSlice(slice []interface{}) []map[string]interface{} {
@@ -726,10 +935,27 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module)
 		}
 		targetBody, err := navigateNestedPath(resBlock.Body(), edit.Steps)
 		if err != nil {
+			if isAmbiguousNestedMatch(err) {
+				return p, qualAttr, nil, &provenance.Unresolved{
+					Address: edit.DriftAddr, Attr: qualAttr,
+					Reason: err.Error(),
+				}
+			}
 			// Block path not found in this file; try the next.
 			continue
 		}
 		if targetBody.GetAttribute(edit.Attr) == nil {
+			if canAddMissingNestedAttr(edit) {
+				newVal, ctyErr := toCty(edit.Value)
+				if ctyErr != nil {
+					return p, qualAttr, nil, &provenance.Unresolved{
+						Address: edit.DriftAddr, Attr: qualAttr, Reason: ctyErr.Error(),
+					}
+				}
+				targetBody.SetAttributeValue(edit.Attr, newVal)
+				ff.dirty = true
+				return p, qualAttr, nil, nil
+			}
 			// Computed / not in config: skip silently (same rule as top-level).
 			return p, qualAttr, nil, nil
 		}
@@ -767,6 +993,40 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module)
 	return "", qualAttr, nil, nil
 }
 
+// applyBlockAttrRemove navigates to a nested block and removes an attribute
+// that disappeared from refreshed reality.
+func (de *dirEditor) applyBlockAttrRemove(remove BlockAttrRemove) (path, qualAttr string, u *provenance.Unresolved) {
+	outerType := "resource"
+	if remove.ResMode == "data" {
+		outerType = "data"
+	}
+	qualAttr = qualifiedAttr(remove.Steps, remove.Attr)
+
+	for p, ff := range de.files {
+		resBlock := ff.f.Body().FirstMatchingBlock(outerType, []string{remove.ResType, remove.ResName})
+		if resBlock == nil {
+			continue
+		}
+		targetBody, err := navigateNestedPath(resBlock.Body(), remove.Steps)
+		if err != nil {
+			if isAmbiguousNestedMatch(err) {
+				return p, qualAttr, &provenance.Unresolved{
+					Address: remove.DriftAddr, Attr: qualAttr,
+					Reason: err.Error(),
+				}
+			}
+			continue
+		}
+		if targetBody.GetAttribute(remove.Attr) == nil {
+			return p, qualAttr, nil
+		}
+		targetBody.RemoveAttribute(remove.Attr)
+		ff.dirty = true
+		return p, qualAttr + "-removed", nil
+	}
+	return "", qualAttr, nil
+}
+
 // applyBlockStructChange adds and removes nested blocks in the parent body
 // described by sc.Steps, within the resource block in de's files.
 func (de *dirEditor) applyBlockStructChange(sc BlockStructuralChange) (path string, absorbed []string, unresolved []provenance.Unresolved) {
@@ -802,7 +1062,14 @@ func (de *dirEditor) applyBlockStructChange(sc BlockStructuralChange) (path stri
 
 		// Remove blocks that disappeared out-of-band.
 		for _, bm := range sc.Removed {
-			block := findMatchingNestedBlock(parentBody, sc.BlockType, bm, map[string]interface{}{})
+			block, matchErr := findMatchingNestedBlock(parentBody, sc.BlockType, bm, map[string]interface{}{})
+			if matchErr != nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: sc.DriftAddr, Attr: sc.BlockType,
+					Reason: "could not find matching block to remove: " + matchErr.Error(),
+				})
+				continue
+			}
 			if block == nil {
 				unresolved = append(unresolved, provenance.Unresolved{
 					Address: sc.DriftAddr, Attr: sc.BlockType,
@@ -833,7 +1100,10 @@ func (de *dirEditor) applyBlockStructChange(sc BlockStructuralChange) (path stri
 func navigateNestedPath(root *hclwrite.Body, steps []BlockStep) (*hclwrite.Body, error) {
 	cur := root
 	for _, step := range steps {
-		block := findMatchingNestedBlock(cur, step.BlockType, step.Before, step.Drifted)
+		block, err := findMatchingNestedBlock(cur, step.BlockType, step.Before, step.Drifted)
+		if err != nil {
+			return nil, err
+		}
 		if block == nil {
 			return nil, fmt.Errorf("nested block %q not found", step.BlockType)
 		}
@@ -850,7 +1120,7 @@ func findMatchingNestedBlock(
 	body *hclwrite.Body,
 	blockType string,
 	before, drifted map[string]interface{},
-) *hclwrite.Block {
+) (*hclwrite.Block, error) {
 	var candidates []*hclwrite.Block
 	for _, b := range body.Blocks() {
 		if b.Type() == blockType {
@@ -859,9 +1129,9 @@ func findMatchingNestedBlock(
 	}
 	switch len(candidates) {
 	case 0:
-		return nil
+		return nil, nil
 	case 1:
-		return candidates[0]
+		return candidates[0], nil
 	default:
 		stable := make(map[string]interface{}, len(before))
 		for k, v := range before {
@@ -870,13 +1140,25 @@ func findMatchingNestedBlock(
 			}
 		}
 		best, bestScore := candidates[0], -1
+		ties := 0
 		for _, c := range candidates {
-			if s := bodyMatchScore(c.Body(), stable); s > bestScore {
+			s := bodyMatchScore(c.Body(), stable)
+			switch {
+			case s > bestScore:
 				bestScore = s
 				best = c
+				ties = 1
+			case s == bestScore:
+				ties++
 			}
 		}
-		return best
+		if bestScore <= 0 {
+			return nil, fmt.Errorf("ambiguous nested block %q match: no stable literal attributes matched", blockType)
+		}
+		if ties > 1 {
+			return nil, fmt.Errorf("ambiguous nested block %q match: multiple blocks matched equally", blockType)
+		}
+		return best, nil
 	}
 }
 
@@ -903,6 +1185,10 @@ func bodyMatchScore(body *hclwrite.Body, stableAttrs map[string]interface{}) int
 		}
 	}
 	return score
+}
+
+func isAmbiguousNestedMatch(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "ambiguous nested block")
 }
 
 // generateHCLBlock creates an hclwrite.Block from a JSON-decoded attribute map.
@@ -1049,7 +1335,7 @@ func forEachIsMap(body *hclwrite.Body) bool {
 func isDynamicAtPath(root *hclwrite.Body, steps []BlockStep) bool {
 	cur := root
 	for _, step := range steps {
-		block := findMatchingNestedBlock(cur, step.BlockType, step.Before, step.Drifted)
+		block, _ := findMatchingNestedBlock(cur, step.BlockType, step.Before, step.Drifted)
 		if block == nil {
 			return findDynamicBlock(cur, step.BlockType) != nil
 		}
@@ -1074,10 +1360,27 @@ func qualifiedAttr(steps []BlockStep, attr string) string {
 	}
 	parts := make([]string, 0, len(steps)+1)
 	for _, s := range steps {
-		parts = append(parts, s.BlockType)
+		parts = append(parts, blockStepLabel(s))
 	}
 	parts = append(parts, attr)
 	return strings.Join(parts, ".")
+}
+
+func blockStepLabel(step BlockStep) string {
+	if name, ok := step.Before["name"]; ok {
+		if s, ok := name.(string); ok && s != "" {
+			return step.BlockType + "[" + quoteHCLString(s) + "]"
+		}
+	}
+	return step.BlockType
+}
+
+func quoteHCLString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `"` + s + `"`
+	}
+	return string(b)
 }
 
 // ---- Shared HCL utilities -----------------------------------------------
@@ -1134,6 +1437,62 @@ func isSensitiveAttr(afterSensitive interface{}, attr string) bool {
 	v := m[attr]
 	b, ok := v.(bool)
 	return ok && b // only true when the attr is explicitly marked true
+}
+
+func isSensitiveNested(afterSensitive interface{}, attr string) bool {
+	if afterSensitive == nil {
+		return false
+	}
+	if b, ok := afterSensitive.(bool); ok {
+		return b
+	}
+	m, ok := afterSensitive.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	return hasSensitiveValue(m[attr])
+}
+
+func sensitiveSlice(afterSensitive interface{}, attr string) []interface{} {
+	if afterSensitive == nil {
+		return nil
+	}
+	if b, ok := afterSensitive.(bool); ok && b {
+		return []interface{}{true}
+	}
+	m, ok := afterSensitive.(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	s, _ := m[attr].([]interface{})
+	return s
+}
+
+func sensitiveAt(s []interface{}, i int) interface{} {
+	if i < 0 || i >= len(s) {
+		return nil
+	}
+	return s[i]
+}
+
+func hasSensitiveValue(v interface{}) bool {
+	switch x := v.(type) {
+	case bool:
+		return x
+	case map[string]interface{}:
+		for _, child := range x {
+			if hasSensitiveValue(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range x {
+			if hasSensitiveValue(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // toCty converts a JSON-decoded value into a cty.Value via its implied type.

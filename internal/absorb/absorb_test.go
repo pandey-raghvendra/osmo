@@ -74,6 +74,125 @@ func TestNullAfterValueSkipped(t *testing.T) {
 	}
 }
 
+func TestNestedSensitiveAttrSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  root_block_device {
+    volume_size = 20
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}},
+		},
+		After: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(50)}},
+		},
+		AfterSensitive: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": true}},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (nested sensitive attr), got %d:\n%s", len(changes), changes[0].After)
+	}
+	if len(unresolved) == 0 {
+		t.Fatal("want nested sensitive unresolved, got none")
+	}
+	found := false
+	for _, u := range unresolved {
+		if u.Attr == "root_block_device.volume_size" && strings.Contains(u.Reason, "sensitive") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("want nested sensitive unresolved, got %v", unresolved)
+	}
+}
+
+func TestNestedNullAfterValueSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  root_block_device {
+    volume_size = 20
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}},
+		},
+		After: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": nil}},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes (nested null after value), got %d", len(changes))
+	}
+	if len(unresolved) != 1 || unresolved[0].Attr != "root_block_device.volume_size" || !strings.Contains(unresolved[0].Reason, "null") {
+		t.Fatalf("want nested null-value unresolved, got %v", unresolved)
+	}
+}
+
+func TestNestedMissingAfterAttrRemoved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp2"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20), "volume_type": "gp2"}},
+		},
+		After: map[string]interface{}{
+			"root_block_device": []interface{}{map[string]interface{}{"volume_type": "gp2"}},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 attr-removal change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if strings.Contains(got, "volume_size") {
+		t.Fatalf("removed nested attr still present:\n%s", got)
+	}
+	if !strings.Contains(got, `volume_type = "gp2"`) {
+		t.Fatalf("sibling attr lost:\n%s", got)
+	}
+}
+
 // writeFile writes content to dir/name, creating parent dirs.
 func writeFile(t *testing.T, dir, name, content string) {
 	t.Helper()
@@ -485,6 +604,214 @@ func TestNestedBlockMultiInstanceMatchByStableAttr(t *testing.T) {
 	}
 }
 
+func TestNestedBlockSameCountReplacement(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "azurerm_application_gateway" "agw" {
+  backend_http_settings {
+    name                  = "old-setting"
+    port                  = 80
+    protocol              = "Http"
+    cookie_based_affinity = "Disabled"
+  }
+
+  backend_http_settings {
+    name                  = "stable-setting"
+    port                  = 8080
+    protocol              = "Http"
+    cookie_based_affinity = "Disabled"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"azurerm_application_gateway.agw","mode":"managed","type":"azurerm_application_gateway","name":"agw","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
+		Before: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{"name": "old-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+				map[string]interface{}{"name": "stable-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+			},
+		},
+		After: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{"name": "new-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+				map[string]interface{}{"name": "stable-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 same-count replacement change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if strings.Contains(got, "old-setting") {
+		t.Errorf("removed setting still present:\n%s", got)
+	}
+	if !strings.Contains(got, "new-setting") {
+		t.Errorf("added setting missing:\n%s", got)
+	}
+	if !strings.Contains(got, "stable-setting") {
+		t.Errorf("stable setting lost:\n%s", got)
+	}
+}
+
+func TestNamedNestedAttrEditReportsIdentity(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "azurerm_application_gateway" "agw" {
+  backend_http_settings {
+    name                  = "api-setting"
+    port                  = 80
+    protocol              = "Http"
+    cookie_based_affinity = "Disabled"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"azurerm_application_gateway.agw","mode":"managed","type":"azurerm_application_gateway","name":"agw","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
+		Before: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{"name": "api-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+			},
+		},
+		After: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{"name": "api-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 || len(changes[0].Edits) != 1 {
+		t.Fatalf("want 1 named nested edit, got changes=%d edits=%v", len(changes), changes)
+	}
+	attrs := changes[0].Edits[0].Attrs
+	want := `backend_http_settings["api-setting"].port`
+	if len(attrs) != 1 || attrs[0] != want {
+		t.Fatalf("attrs = %v, want %q", attrs, want)
+	}
+}
+
+func TestAppGatewayMissingBackendHTTPSettingsProbeNameAdded(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "azurerm_application_gateway" "agw" {
+  backend_http_settings {
+    name                                = "bhs-adds-apis"
+    cookie_based_affinity               = "Enabled"
+    pick_host_name_from_backend_address = true
+    port                                = 443
+    protocol                            = "Https"
+    request_timeout                     = 30
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"azurerm_application_gateway.agw","mode":"managed","type":"azurerm_application_gateway","name":"agw","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
+		Before: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{
+					"name": "bhs-adds-apis", "cookie_based_affinity": "Enabled",
+					"pick_host_name_from_backend_address": true, "port": float64(443),
+					"protocol": "Https", "request_timeout": float64(30), "probe_name": "",
+				},
+			},
+		},
+		After: map[string]interface{}{
+			"backend_http_settings": []interface{}{
+				map[string]interface{}{
+					"name": "bhs-adds-apis", "cookie_based_affinity": "Enabled",
+					"pick_host_name_from_backend_address": true, "port": float64(443),
+					"protocol": "Https", "request_timeout": float64(30), "probe_name": "probe-adds-apis-path",
+				},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 probe_name insertion change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if !strings.Contains(got, `probe_name`) || !strings.Contains(got, `"probe-adds-apis-path"`) {
+		t.Fatalf("probe_name was not added:\n%s", got)
+	}
+	attrs := changes[0].Edits[0].Attrs
+	want := `backend_http_settings["bhs-adds-apis"].probe_name`
+	if len(attrs) != 1 || attrs[0] != want {
+		t.Fatalf("attrs = %v, want %q", attrs, want)
+	}
+}
+
+func TestNestedBlockCollectionAmbiguousPairingUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_security_group" "sg" {
+  ingress {
+    from_port = 80
+    protocol  = "tcp"
+  }
+
+  ingress {
+    from_port = 443
+    protocol  = "tcp"
+  }
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_security_group.sg","mode":"managed","type":"aws_security_group","name":"sg","expressions":{}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
+		Before: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "protocol": "tcp"},
+				map[string]interface{}{"from_port": float64(443), "protocol": "tcp"},
+			},
+		},
+		After: map[string]interface{}{
+			"ingress": []interface{}{
+				map[string]interface{}{"from_port": float64(80), "protocol": "udp"},
+				map[string]interface{}{"from_port": float64(80), "protocol": "http"},
+			},
+		},
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 0 {
+		t.Fatalf("want 0 changes for ambiguous collection pairing, got %d:\n%s", len(changes), changes[0].After)
+	}
+	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "ambiguous nested block collection match") {
+		t.Fatalf("want ambiguous collection unresolved, got %v", unresolved)
+	}
+}
+
 // TestNestedBlockVarRefUnresolved: nested block attr is a var ref but the config
 // expressions tree has no entry for the block (empty expressions: {}).
 // The attr cannot be traced → reported as unresolved, never hardcoded.
@@ -828,7 +1155,7 @@ resource "aws_security_group" "sg" {
 	// Drift: 443 ingress block added out-of-band.
 	drifts := []tfplan.Drift{{
 		Address: "module.sg.aws_security_group.sg",
-		Type: "aws_security_group", Name: "sg",
+		Type:    "aws_security_group", Name: "sg",
 		Before: map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},

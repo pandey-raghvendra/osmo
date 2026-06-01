@@ -99,3 +99,47 @@ func TestAbsorbAgainstRealShowJSON(t *testing.T) {
 		t.Errorf("module source was wrongly modified:\n%s", modSrc)
 	}
 }
+
+func TestAbsorbAgainstRealAzureAppGatewayDrift(t *testing.T) {
+	rawPath := filepath.Join("testdata", "real_appgw_drift_show.json")
+	fixtureDir := filepath.Join("testdata", "appgw_fixture")
+	raw, err := os.ReadFile(rawPath)
+	if err != nil {
+		t.Skipf("optional Azure App Gateway fixture not present (%s): %v", rawPath, err)
+	}
+	if _, err := os.Stat(fixtureDir); err != nil {
+		t.Skipf("optional Azure App Gateway HCL fixture not present (%s): %v", fixtureDir, err)
+	}
+
+	drifts, err := tfplan.ParseDrift(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(drifts) == 0 {
+		t.Fatal("real_appgw_drift_show.json contains no resource_drift")
+	}
+
+	dir := t.TempDir()
+	copyTF(t, fixtureDir, dir)
+
+	changes, unresolved, err := absorb.Plan(dir, drifts, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) == 0 {
+		t.Fatalf("expected App Gateway fixture to produce changes; unresolved: %v", unresolved)
+	}
+	foundHTTPSettings := false
+	for _, c := range changes {
+		for _, e := range c.Edits {
+			for _, attr := range e.Attrs {
+				if strings.Contains(attr, "backend_http_settings") {
+					foundHTTPSettings = true
+				}
+			}
+		}
+	}
+	if !foundHTTPSettings {
+		t.Fatalf("expected backend_http_settings drift to be absorbed; changes=%+v unresolved=%v", changes, unresolved)
+	}
+}
