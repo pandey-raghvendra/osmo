@@ -703,6 +703,35 @@ func (de *dirEditor) applyForEachMapPatch(addr address.Addr, instanceKey, mapAtt
 			if !ok || key != instanceKey {
 				continue
 			}
+
+			// mapAttr == "" means each.value direct: for_each = {a = "scalar"}.
+			// Patch the entry value itself, not a nested attribute.
+			if mapAttr == "" {
+				if !isHCLLiteral(item.ValueExpr) {
+					return unres(fmt.Sprintf(
+						"for_each[%q] value is not a literal; cannot patch automatically", instanceKey))
+				}
+				newValBytes, err := renderTFValue(value)
+				if err != nil {
+					return unres(err.Error())
+				}
+				vr := item.ValueExpr.Range()
+				start, end := vr.Start.Byte, vr.End.Byte
+				newExpr := make([]byte, 0, len(exprBytes)+len(newValBytes))
+				newExpr = append(newExpr, exprBytes[:start]...)
+				newExpr = append(newExpr, newValBytes...)
+				newExpr = append(newExpr, exprBytes[end:]...)
+				tmpSrc := append([]byte("x = "), append(bytes.TrimRight(newExpr, "\n"), '\n')...)
+				tmpFile, tmpDiags := hclwrite.ParseConfig(tmpSrc, "<tmp>", hcl.Pos{Line: 1, Column: 1})
+				if tmpDiags.HasErrors() {
+					return unres("rebuild for_each after scalar patch: " + tmpDiags.Error())
+				}
+				resBlock.Body().SetAttributeRaw("for_each", tmpFile.Body().GetAttribute("x").Expr().BuildTokens(nil))
+				ff.dirty = true
+				return path, nil
+			}
+
+			// mapAttr != "" means each.value.X: for_each = {a = {attr = "val"}}.
 			innerObj, ok := item.ValueExpr.(*hclsyntax.ObjectConsExpr)
 			if !ok {
 				return unres(fmt.Sprintf("for_each value for key %q is not an object literal", instanceKey))
@@ -712,7 +741,6 @@ func (de *dirEditor) applyForEachMapPatch(addr address.Addr, instanceKey, mapAtt
 				if !ok || attr != mapAttr {
 					continue
 				}
-				// Only patch literal values — reject references.
 				if !isHCLLiteral(inner.ValueExpr) {
 					return unres(fmt.Sprintf(
 						"for_each[%q].%s is not a literal value; cannot patch automatically", instanceKey, mapAttr))
@@ -721,22 +749,18 @@ func (de *dirEditor) applyForEachMapPatch(addr address.Addr, instanceKey, mapAtt
 				if err != nil {
 					return unres(err.Error())
 				}
-				// Byte-surgery: replace the full value span within exprBytes.
 				vr := inner.ValueExpr.Range()
 				start, end := vr.Start.Byte, vr.End.Byte
 				newExpr := make([]byte, 0, len(exprBytes)+len(newValBytes))
 				newExpr = append(newExpr, exprBytes[:start]...)
 				newExpr = append(newExpr, newValBytes...)
 				newExpr = append(newExpr, exprBytes[end:]...)
-
-				// Rebuild the for_each attribute via a temp hclwrite parse.
 				tmpSrc := append([]byte("x = "), append(bytes.TrimRight(newExpr, "\n"), '\n')...)
 				tmpFile, tmpDiags := hclwrite.ParseConfig(tmpSrc, "<tmp>", hcl.Pos{Line: 1, Column: 1})
 				if tmpDiags.HasErrors() {
 					return unres("rebuild for_each after patch: " + tmpDiags.Error())
 				}
-				newTokens := tmpFile.Body().GetAttribute("x").Expr().BuildTokens(nil)
-				resBlock.Body().SetAttributeRaw("for_each", newTokens)
+				resBlock.Body().SetAttributeRaw("for_each", tmpFile.Body().GetAttribute("x").Expr().BuildTokens(nil))
 				ff.dirty = true
 				return path, nil
 			}

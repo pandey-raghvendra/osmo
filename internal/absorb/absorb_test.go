@@ -1388,6 +1388,46 @@ func TestForEachMapEntryOtherInstanceUntouched(t *testing.T) {
 	}
 }
 
+func TestForEachScalarDirectValue(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  for_each      = { a = "t3.micro", b = "t3.small" }
+  instance_type = each.value
+}
+`)
+	// References contain each.value directly (not each.value.X).
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"references":["each.value","each"]}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: `aws_instance.web["a"]`, Type: "aws_instance", Name: "web",
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if !strings.Contains(got, `"t3.large"`) {
+		t.Errorf("instance a not updated:\n%s", got)
+	}
+	if !strings.Contains(got, `"t3.small"`) {
+		t.Errorf("instance b value lost:\n%s", got)
+	}
+	if strings.Contains(got, `"t3.micro"`) {
+		t.Errorf("old value still present:\n%s", got)
+	}
+}
+
 func TestForEachMapEntryMissingKeyReportsUnresolved(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {

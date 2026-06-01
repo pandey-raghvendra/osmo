@@ -98,18 +98,18 @@ func Trace(root *config.Module, addr address.Addr, attr string, value interface{
 		}, nil
 	}
 
-	// each.value.X: single-instance for_each map entry patching.
+	// each.value / each.value.X: single-instance for_each map entry patching.
 	// Safe only when: (a) the resource has a string instance key, and
 	// (b) all references collapse to a single each.value traversal.
 	if instanced && !isCountKey(instKey) {
-		if mapAttr := eachValueMapAttr(expr.References); mapAttr != "" {
+		if mapAttr, ok := eachValueMapAttr(expr.References); ok {
 			k := instKey
 			return &Target{
 				Kind:         ForEachMapEntry,
 				ResourceMode: addr.Mode,
 				ResourceType: addr.Type,
 				ResourceName: addr.Name,
-				Attr:         mapAttr, // attribute within the for_each map entry value
+				Attr:         mapAttr, // "" = scalar entry; "name" = nested attr
 				Value:        value,
 				InstanceKey:  &k,
 			}, nil
@@ -355,18 +355,27 @@ func isCountKey(k string) bool {
 	return true
 }
 
-// eachValueMapAttr scans a reference list for "each.value.<attr>" and returns
-// the <attr> part. Returns "" if the references don't follow this pattern.
-func eachValueMapAttr(refs []string) string {
+// eachValueMapAttr scans refs for an each.value reference.
+//
+// Returns ("attrName", true) for each.value.attrName (map-of-objects),
+// ("", true) for each.value direct (map-of-scalars),
+// ("", false) if no each.value pattern is found.
+func eachValueMapAttr(refs []string) (string, bool) {
 	const prefix = "each.value."
+	directFound := false
 	for _, r := range refs {
 		if strings.HasPrefix(r, prefix) {
 			name := r[len(prefix):]
-			// Must be a simple identifier (no further dots).
 			if name != "" && !strings.Contains(name, ".") {
-				return name
+				return name, true
 			}
 		}
+		if r == "each.value" {
+			directFound = true
+		}
 	}
-	return ""
+	if directFound {
+		return "", true // scalar entry: each.value used directly
+	}
+	return "", false
 }
