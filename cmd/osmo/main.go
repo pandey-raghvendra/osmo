@@ -237,6 +237,19 @@ func run(ctx context.Context, o runOpts) (int, error) {
 		return exitError, err
 	}
 
+	// Format each changed file in-memory so diffs and written files are both
+	// terraform-fmt-clean. Failures are non-fatal: warn and keep unformatted.
+	for i, c := range changes {
+		formatted, fmtErr := tfplan.Fmt(ctx, o.bin, c.After)
+		if fmtErr != nil {
+			if !o.jsonOut {
+				fmt.Fprintf(os.Stderr, "warning: terraform fmt failed for %s: %v\n", c.Path, fmtErr)
+			}
+			continue
+		}
+		changes[i].After = formatted
+	}
+
 	if o.jsonOut {
 		return runJSON(ctx, o, changes, unresolved, len(drifts))
 	}

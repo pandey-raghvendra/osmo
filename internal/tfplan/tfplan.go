@@ -156,6 +156,22 @@ func isActionable(actions []string) bool {
 	return false
 }
 
+// Fmt runs `terraform fmt -` on src and returns the formatted HCL.
+// Returns (src, err) unchanged if terraform is unavailable or the content
+// cannot be formatted — callers should warn and proceed with unformatted output.
+func Fmt(ctx context.Context, bin string, src []byte) ([]byte, error) {
+	if bin == "" {
+		bin = "terraform"
+	}
+	cmd := exec.CommandContext(ctx, bin, "fmt", "-")
+	cmd.Stdin = bytes.NewReader(src)
+	out, err := cmd.Output()
+	if err != nil {
+		return src, err
+	}
+	return out, nil
+}
+
 func run(ctx context.Context, dir, bin string, args ...string) error {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = dir

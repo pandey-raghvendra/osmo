@@ -11,6 +11,23 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.6] - 2026-06-01
+
+### Added
+- **`terraform fmt` post-absorb**: each changed file's HCL is piped through
+  `terraform fmt -` in-memory before diffs are shown and before writing to
+  disk. Both the diff output and the written files are fmt-clean. Failures are
+  non-fatal — osmo warns and proceeds with unformatted content.
+- **`.osmo.json` defaults section**: per-project defaults for `dir`,
+  `terraform`, `targets`, `excludes`, `write`, `verify`, `json`. CLI flags
+  always take precedence. Removes the need to repeat flags on every invocation.
+- **`[dry run]` labeling**: output explicitly says `[dry run]` when `-write` is
+  not set, removing ambiguity between proposed and applied changes.
+- **Troubleshooting section** and expanded known-limitations table in README.
+- **CHANGELOG.md** (this file).
+
+---
+
 ## [0.1.5] - 2026-06-01
 
 ### Added

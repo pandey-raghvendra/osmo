@@ -29,7 +29,7 @@ osmo -dir ./infra -write -verify
 |---|---|---|
 | `-dir` | `.` | Terraform working directory |
 | `-terraform` | `terraform` | Terraform binary path |
-| `-write` | `false` | Write changes to disk (else diff only) |
+| `-write` | `false` | Write changes to disk (else dry-run diff only) |
 | `-verify` | `false` | After writing, run a normal plan; roll back files if any absorbed resource still has a planned change (requires `-write`; not usable with `-plan-json`) |
 | `-approve` | `false` | Interactively approve each file change before writing (requires `-write` and a TTY) |
 | `-json` | `false` | Emit a single JSON object to stdout instead of human-readable output |
