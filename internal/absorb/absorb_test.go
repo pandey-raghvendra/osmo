@@ -44,9 +44,9 @@ func TestSensitiveAttrSkipped(t *testing.T) {
 	}
 }
 
-// TestNullAfterValueSkipped: drift attr with null after-value must be reported
-// as unresolved rather than setting the attr to null or crashing.
-func TestNullAfterValueSkipped(t *testing.T) {
+// TestNullAfterValueRemoved: root-level scalar with null after-value must be
+// removed from config (attr deleted from reality → remove the literal).
+func TestNullAfterValueRemoved(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
   instance_type = "t3.micro"
@@ -66,11 +66,56 @@ func TestNullAfterValueSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 0 {
-		t.Fatalf("want 0 changes (null after value), got %d", len(changes))
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
 	}
-	if len(unresolved) != 1 || !strings.Contains(unresolved[0].Reason, "null") {
-		t.Fatalf("want 1 null-value unresolved, got %v", unresolved)
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change (attr removal), got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if strings.Contains(got, "instance_type") {
+		t.Fatalf("instance_type should have been removed, got:\n%s", got)
+	}
+}
+
+// TestAbsentAfterValueRemoved: attr present in before but absent from after
+// (key not present at all in reality) must also be removed from config.
+func TestAbsentAfterValueRemoved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  instance_type = "t3.micro"
+  key_name      = "my-key"
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{
+				"instance_type":{"constant_value":"t3.micro"},
+				"key_name":{"constant_value":"my-key"}
+			}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: map[string]interface{}{"instance_type": "t3.micro", "key_name": "my-key"},
+		After:  map[string]interface{}{"instance_type": "t3.micro"}, // key_name absent = deleted from reality
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change (absent key removal), got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if strings.Contains(got, "key_name") {
+		t.Fatalf("key_name should have been removed, got:\n%s", got)
+	}
+	if !strings.Contains(got, "instance_type") {
+		t.Fatalf("instance_type should be preserved, got:\n%s", got)
 	}
 }
 
@@ -119,7 +164,9 @@ func TestNestedSensitiveAttrSkipped(t *testing.T) {
 	}
 }
 
-func TestNestedNullAfterValueSkipped(t *testing.T) {
+// TestNestedNullAfterValueRemoved: nested attr with explicit null after-value
+// must be removed from config (same as absent key = removed from reality).
+func TestNestedNullAfterValueRemoved(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
   root_block_device {
@@ -144,11 +191,15 @@ func TestNestedNullAfterValueSkipped(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(changes) != 0 {
-		t.Fatalf("want 0 changes (nested null after value), got %d", len(changes))
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
 	}
-	if len(unresolved) != 1 || unresolved[0].Attr != "root_block_device.volume_size" || !strings.Contains(unresolved[0].Reason, "null") {
-		t.Fatalf("want nested null-value unresolved, got %v", unresolved)
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change (nested attr removal), got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if strings.Contains(got, "volume_size") {
+		t.Fatalf("volume_size should have been removed, got:\n%s", got)
 	}
 }
 

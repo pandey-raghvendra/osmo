@@ -135,6 +135,11 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		driftAddr string
 		attr      string
 	}
+	type scalarRemoveOp struct {
+		addr      address.Addr
+		driftAddr string
+		attr      string
+	}
 	type nestedAttrOp struct {
 		addr address.Addr
 		edit BlockAttrEdit
@@ -149,6 +154,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 	}
 
 	var scalarOps []scalarOp
+	var scalarRemoveOps []scalarRemoveOp
 	var nestedAttrOps []nestedAttrOp
 	var nestedAttrRemoveOps []nestedAttrRemoveOp
 	var nestedStructOps []nestedStructOp
@@ -178,12 +184,9 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			if _, isSlice := av.([]interface{}); isSlice {
 				continue // handled by walkDriftMap below
 			}
-			// Guard: null after-value means the attr was removed in reality.
+			// Null after-value: attr removed from reality → remove from config.
 			if av == nil {
-				unresolved = append(unresolved, provenance.Unresolved{
-					Address: d.Address, Attr: k,
-					Reason: "after value is null (attribute removed in reality); removal from config not supported automatically",
-				})
+				scalarRemoveOps = append(scalarRemoveOps, scalarRemoveOp{addr, d.Address, k})
 				continue
 			}
 			// Guard: sensitive after-value must not be written to plain-text config.
@@ -200,6 +203,19 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 				continue
 			}
 			scalarOps = append(scalarOps, scalarOp{t, d.Address, k})
+		}
+		// Attrs present in before but absent from after: also removed from reality.
+		for k, bv := range d.Before {
+			if _, inAfter := d.After[k]; inAfter {
+				continue
+			}
+			if reflect.DeepEqual(bv, nil) {
+				continue
+			}
+			if _, isSlice := bv.([]interface{}); isSlice {
+				continue // structural removal handled by walkDriftMap
+			}
+			scalarRemoveOps = append(scalarRemoveOps, scalarRemoveOp{addr, d.Address, k})
 		}
 
 		// Nested block attrs + structural changes → recursive walk.
@@ -269,6 +285,28 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			continue
 		}
 		record(path, o.driftAddr, o.attr)
+	}
+
+	// Scalar remove ops: remove root-level attrs deleted from reality.
+	for _, o := range scalarRemoveOps {
+		dir, err := resolveDir(root, baseDir, o.addr.Modules)
+		if err != nil {
+			unresolved = append(unresolved, provenance.Unresolved{
+				Address: o.driftAddr, Attr: o.attr, Reason: err.Error()})
+			continue
+		}
+		de, err := getEditor(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		path, u := de.applyScalarRemove(o.addr, o.attr)
+		if u != nil {
+			unresolved = append(unresolved, *u)
+			continue
+		}
+		if path != "" {
+			record(path, o.driftAddr, o.attr+"-removed")
+		}
 	}
 
 	// Nested attr ops: attempt literal edit in the resource's own dir; fall back
@@ -543,6 +581,31 @@ func (de *dirEditor) apply(t *provenance.Target) (string, error) {
 	return "", fmt.Errorf("could not locate %s %v in %s", blockType, labels, de.dir)
 }
 
+// applyScalarRemove removes a root-level resource attribute that disappeared from
+// refreshed reality. Only literal attributes inside the resource block itself are
+// removed; if the attribute traces through a module arg or variable default, removal
+// is unsafe and an Unresolved is returned so the caller can report it.
+func (de *dirEditor) applyScalarRemove(addr address.Addr, attr string) (string, *provenance.Unresolved) {
+	outerType := "resource"
+	if addr.Mode == "data" {
+		outerType = "data"
+	}
+	for path, ff := range de.files {
+		resBlock := ff.f.Body().FirstMatchingBlock(outerType, []string{addr.Type, addr.Name})
+		if resBlock == nil {
+			continue
+		}
+		if resBlock.Body().GetAttribute(attr) == nil {
+			// Not a literal in config (computed or not set) — nothing to remove.
+			return path, nil
+		}
+		resBlock.Body().RemoveAttribute(attr)
+		ff.dirty = true
+		return path, nil
+	}
+	return "", nil
+}
+
 func blockSelector(t *provenance.Target) (blockType string, labels []string, attr string) {
 	switch t.Kind {
 	case provenance.ResourceAttr:
@@ -620,9 +683,14 @@ func walkDriftMap(
 				continue
 			}
 			if av == nil {
-				unresolved = append(unresolved, provenance.Unresolved{
-					Address: driftAddr, Attr: qualAttr,
-					Reason: "after value is null (attribute removed in reality); removal from config not supported automatically",
+				// Explicit null in after = attr removed from reality; treat same as absent key.
+				removes = append(removes, BlockAttrRemove{
+					DriftAddr: driftAddr,
+					ResType:   addr.Type,
+					ResName:   addr.Name,
+					ResMode:   addr.Mode,
+					Steps:     path,
+					Attr:      k,
 				})
 				continue
 			}

@@ -123,7 +123,8 @@ you run terraform plan   → 0 diff = drift fully resolved
 | Deep nesting (3+ levels) | `server_side_encryption_configuration > rule > ...` | ✅ |
 | `dynamic` block — `for_each = var.x` | collection variable updated to full after-state | ✅ |
 | Sensitive attr (`after_sensitive = true`) | skipped, reported — never written to plain text | ✅ |
-| Null after-value (attr removed in reality) | skipped, reported — removal not auto-applied | ✅ |
+| Scalar attr removed from reality (null or absent in after) | literal removed from resource block | ✅ |
+| Nested block attr removed from reality | literal removed from nested block body | ✅ |
 
 ### Safely reported, never silently wrong
 
