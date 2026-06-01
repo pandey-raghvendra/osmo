@@ -55,9 +55,15 @@ func (r *repeatedFlag) Set(v string) error {
 
 func main() {
 	// Subcommand dispatch (before flag.Parse so global flags don't shadow them).
-	if len(os.Args) > 1 && os.Args[1] == "triage" {
-		triageCmd(os.Args[2:])
-		return
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "triage":
+			triageCmd(os.Args[2:])
+			return
+		case "ui":
+			uiCmd(os.Args[2:])
+			return
+		}
 	}
 
 	dir := flag.String("dir", ".", "Terraform working directory")

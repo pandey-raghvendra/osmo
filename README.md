@@ -57,6 +57,36 @@ osmo -dir ./infra -write -verify
 | `-exclude` | `` | Skip drift on this resource address (repeatable / comma-separated; wins over `-target`) |
 | `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
 
+## Interactive UI
+
+```sh
+osmo ui -dir ./infra          # detect drift, open interactive TUI
+osmo ui -plan-json plan.json  # TUI from saved plan
+```
+
+```
+osmo ui · 3 resource(s) · ./infra
+
+╭────────────────────────────────────────────────────────────────────────╮
+│   ✅ aws_instance.web                safe    instance_type    absorb   │
+│   ⚠️  aws_autoscaling_group.api      review  desired_capacity skip      │
+│ ▶ 🚩 aws_security_group.public      flag    ingress          skip      │
+╰────────────────────────────────────────────────────────────────────────╯
+╭─ aws_security_group.public ────────────────────────────────────────────╮
+│                                                                         │
+│  - ingress                  = []                                        │
+│  + ingress                  = [{"cidr":"0.0.0.0/0","from_port":8080}]  │
+│                                                                         │
+│  ⓘ aws_security_group: controls network ingress/egress                 │
+│  💡 investigate before absorbing                                        │
+╰────────────────────────────────────────────────────────────────────────╯
+[↑↓/jk] navigate  [a] absorb  [s] skip  [A] absorb-all-safe  [x] execute  [q] quit
+```
+
+Press **`x`** — osmo runs immediately with the right `-target`/`-exclude` flags for your selections.
+
+---
+
 ## Drift triage — know what's safe before absorbing
 
 ```sh

@@ -11,6 +11,21 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.4.0] - 2026-06-02
+
+### Added
+- **`osmo ui` subcommand**: interactive terminal TUI (Bubble Tea) for drift
+  triage and selective absorb. No API key, fully offline.
+  - Resource list with ✅ / ⚠️  / 🚩 verdict icons and action status
+  - Before/after diff panel for selected resource with syntax colouring
+  - Per-resource toggle: `[a]` absorb · `[s]` skip
+  - Bulk shortcuts: `[A]` absorb all safe · `[S]` skip all
+  - `[x]` executes osmo immediately with the right `-target`/`-exclude` flags
+  - Diff panel scrolling (`pgup`/`pgdn`) for large nested changes
+  - Reads from live detection, piped `-json`, or `-plan-json` file
+
+---
+
 ## [1.3.0] - 2026-06-02
 
 ### Added
