@@ -11,6 +11,49 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.2.0] - 2026-06-02
+
+### Added
+- **OpenTofu support**: osmo auto-detects `tofu` on `PATH` when no binary is
+  explicitly configured; falls back to `terraform`. Priority chain:
+  `OSMO_TF_BINARY` env → `-terraform` flag → `.osmo.json` default → auto-detect.
+  All features (absorb, verify, JSON output, TFC) work identically with OpenTofu.
+- **GitHub Action** (`action.yml`): `uses: pandey-raghvendra/osmo@v1` installs
+  osmo and runs it with all flags as inputs. Outputs: `result`, `drift_count`,
+  `exit_code`, `json_path`.
+- **Community files**: `SECURITY.md` (private vulnerability reporting, threat
+  model), `CONTRIBUTING.md` (dev setup, test patterns, commit style),
+  `CODE_OF_CONDUCT.md`, GitHub issue templates (bug / feature request), and
+  PR template.
+
+### Fixed
+- **TFC HTTP client timeout**: TFC API calls used `http.DefaultClient` (no
+  timeout) — a stalled network connection would block indefinitely. Replaced
+  with a 30 s timeout client; context cancellation (Ctrl-C) still fires first.
+- **GitHub Action exit code**: `osmo ... -json > file || true` swallowed
+  osmo's exit code, making CI always see exit 0. Fixed with `; EXIT_CODE=$?`.
+- **Goreleaser changelog**: `chore:` commits no longer appear in release notes.
+
+### Changed
+- `-terraform` flag default updated to reflect auto-detection behaviour
+  (`tofu` → `terraform`).
+- README: OpenTofu section, updated Requirements, GitHub Action install snippet,
+  corrected TFC known-limitation entry.
+
+### Tests
+- `internal/provenance`: 31 new direct unit tests (0 % → 76 % coverage) —
+  `Trace`, `TraceForEach`, `singleVarRef`, `eachValueMapAttr`, `isCountKey`,
+  `quoteKey`, `fullAddr`.
+- `internal/absorb`: `renderTFValue` (all types + error paths),
+  `hclEscapeString` (all special chars including backslash, newline, tab, CR),
+  `isAmbiguousNestedMatch`.
+- `internal/tfplan`: `ParseDrift` (7 cases), `TFValue` accessors, `MarshalJSON`
+  (51 % → 64 % coverage).
+- `cmd/osmo`: `applyConfigDefaults` (3 cases), `run` validation errors,
+  JSON-mode drift-found path (17 % → 33 % coverage).
+
+---
+
 ## [1.1.0] - 2026-06-01
 
 ### Added
