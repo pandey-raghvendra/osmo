@@ -65,6 +65,7 @@ func main() {
 	flag.Var(&targets, "target", "Only absorb drift on this resource address (repeatable / comma-separated; matches modules and indexed instances by prefix)")
 	flag.Var(&excludes, "exclude", "Skip drift on this resource address (repeatable / comma-separated; takes precedence over -target)")
 	ver := flag.Bool("version", false, "Print version and exit")
+	debug := flag.Bool("debug", false, "Print debug trace to stderr (also enabled by OSMO_DEBUG=1)")
 	flag.Parse()
 
 	if *ver {
@@ -93,6 +94,7 @@ func main() {
 		verify:   *verify,
 		approve:  *approve,
 		jsonOut:  *jsonOut,
+		debug:    *debug || os.Getenv("OSMO_DEBUG") == "1",
 		targets:  targets,
 		excludes: excludes,
 	}
@@ -115,8 +117,18 @@ type runOpts struct {
 	verify   bool
 	approve  bool
 	jsonOut  bool
+	debug    bool
 	targets  []string
 	excludes []string
+}
+
+// debugf writes a debug line to stderr when o.debug is true.
+// Output always goes to stderr so it never pollutes -json stdout.
+func (o runOpts) debugf(format string, args ...interface{}) {
+	if !o.debug {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "[debug] "+format+"\n", args...)
 }
 
 // ---- JSON output types --------------------------------------------------
@@ -201,6 +213,10 @@ func run(ctx context.Context, o runOpts) (int, error) {
 	if err != nil {
 		return exitError, err
 	}
+	o.debugf("drift detection: %d resource(s) drifted", len(drifts))
+	for _, d := range drifts {
+		o.debugf("  drift: %s", d.Address)
+	}
 
 	if len(drifts) == 0 {
 		if o.jsonOut {
@@ -217,13 +233,15 @@ func run(ctx context.Context, o runOpts) (int, error) {
 		return exitOK, nil
 	}
 
+	totalDriftCount := len(drifts)
 	drifts = filterDrifts(drifts, o.targets, o.excludes)
+	o.debugf("after target/exclude filter: %d resource(s) selected", len(drifts))
 	if len(drifts) == 0 {
 		if o.jsonOut {
 			writeJSON(JSONResult{
 				OsmoVersion: version,
 				Result:      "no_match",
-				DriftCount:  0,
+				DriftCount:  totalDriftCount,
 				Changes:     []JSONChange{},
 				Unresolved:  []JSONUnresolved{},
 			})
@@ -236,6 +254,16 @@ func run(ctx context.Context, o runOpts) (int, error) {
 	changes, unresolved, err := absorb.Plan(o.dir, drifts, raw)
 	if err != nil {
 		return exitError, err
+	}
+	o.debugf("absorb plan: %d file change(s), %d unresolved attr(s)", len(changes), len(unresolved))
+	for _, c := range changes {
+		o.debugf("  change: %s (%d edit(s))", c.Path, len(c.Edits))
+		for _, e := range c.Edits {
+			o.debugf("    edit: %s attrs=%v", e.Address, e.Attrs)
+		}
+	}
+	for _, u := range unresolved {
+		o.debugf("  unresolved: %s.%s — %s", u.Address, u.Attr, u.Reason)
 	}
 
 	// Format each changed file in-memory so diffs and written files are both
@@ -397,11 +425,13 @@ func loadDrift(ctx context.Context, o runOpts) ([]tfplan.Drift, []byte, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		o.debugf("load: using -plan-json %s", o.planFile)
 		if !o.jsonOut {
 			fmt.Fprintf(os.Stderr, "using plan json: %s (%d drift(s))\n", o.planFile, len(drifts))
 		}
 		return drifts, raw, nil
 	}
+	o.debugf("load: running terraform plan -refresh-only in %s", o.dir)
 	return tfplan.Detect(ctx, o.dir, o.bin)
 }
 
@@ -422,16 +452,21 @@ func writeChanges(changes []absorb.FileChange) ([]absorb.FileChange, error) {
 func plannedChangesForVerify(ctx context.Context, o runOpts) ([]string, error) {
 	b, err := tfc.DetectBackend(o.dir)
 	if err != nil {
-		// Detection error (TFE_TOKEN missing, etc.) — surface it.
 		return nil, fmt.Errorf("TFC backend detected: %w", err)
 	}
 	if b != nil {
+		o.debugf("verify: TFC backend detected, workspace=%s org=%s", b.Workspace, b.Organization)
 		if !o.jsonOut {
 			fmt.Fprintf(os.Stderr, "TFC backend detected (%s) — using speculative plan via API\n", b.WorkspaceURL())
 		}
-		return b.PlannedChanges(ctx, o.dir)
+		addrs, err := b.PlannedChanges(ctx, o.dir)
+		o.debugf("verify: TFC plan returned %d actionable address(es): %v", len(addrs), addrs)
+		return addrs, err
 	}
-	return tfplan.PlannedChanges(ctx, o.dir, o.bin)
+	o.debugf("verify: running local terraform plan")
+	addrs, err := tfplan.PlannedChanges(ctx, o.dir, o.bin)
+	o.debugf("verify: local plan returned %d actionable address(es): %v", len(addrs), addrs)
+	return addrs, err
 }
 
 func verifyAndMaybeRollback(ctx context.Context, o runOpts, written []absorb.FileChange) error {

@@ -70,16 +70,27 @@ func DetectBackend(dir string) (*Backend, error) {
 		host = "app.terraform.io"
 	}
 	org := ts.Backend.Config.Organization
-	ws := ts.Backend.Config.Workspaces.Name
-	if org == "" || ws == "" {
-		return nil, fmt.Errorf("TFC backend detected but organization/workspace not set in .terraform/terraform.tfstate")
+	if org == "" {
+		return nil, fmt.Errorf("TFC backend detected but organization not set in .terraform/terraform.tfstate")
 	}
 
-	// Respect workspace selected with `terraform workspace select`.
+	// Workspace name resolution order:
+	//  1. .terraform/environment (set by `terraform workspace select`)
+	//  2. workspaces.name from backend config (explicit name)
+	//  3. tag-based selection: .terraform/environment must be set — if not, error
+	ws := ""
 	if env, err := os.ReadFile(filepath.Join(dir, ".terraform", "environment")); err == nil {
 		if name := strings.TrimSpace(string(env)); name != "" && name != "default" {
 			ws = name
 		}
+	}
+	if ws == "" {
+		ws = ts.Backend.Config.Workspaces.Name
+	}
+	if ws == "" {
+		return nil, fmt.Errorf("TFC backend detected but workspace name cannot be determined — " +
+			"for tag-based workspace selection run `terraform workspace select <name>` first, " +
+			"or set workspaces.name in your cloud {} block")
 	}
 
 	token := os.Getenv("TFE_TOKEN")

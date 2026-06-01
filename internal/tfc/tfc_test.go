@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -115,6 +116,53 @@ func TestDetectBackend_WorkspaceEnvOverride(t *testing.T) {
 	}
 	if b.Workspace != "feature-branch" {
 		t.Errorf("workspace override: got %q, want %q", b.Workspace, "feature-branch")
+	}
+}
+
+func TestDetectBackend_TagBasedWorkspaceRequiresEnv(t *testing.T) {
+	dir := t.TempDir()
+	// cloud {} with tags= : workspaces.name is empty in tfstate.
+	writeTFState(t, dir, `{
+		"backend": {
+			"type": "cloud",
+			"config": {
+				"organization": "acme",
+				"workspaces": {"name": ""}
+			}
+		}
+	}`)
+	t.Setenv("TFE_TOKEN", "tok")
+	_, err := DetectBackend(dir)
+	if err == nil {
+		t.Fatal("expected error when workspace name is empty and no environment file")
+	}
+	if !strings.Contains(err.Error(), "workspace name cannot be determined") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestDetectBackend_TagBasedWorkspaceWithEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	writeTFState(t, dir, `{
+		"backend": {
+			"type": "cloud",
+			"config": {
+				"organization": "acme",
+				"workspaces": {"name": ""}
+			}
+		}
+	}`)
+	tfDir := filepath.Join(dir, ".terraform")
+	if err := os.WriteFile(filepath.Join(tfDir, "environment"), []byte("tag-selected-ws\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TFE_TOKEN", "tok")
+	b, err := DetectBackend(dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if b.Workspace != "tag-selected-ws" {
+		t.Errorf("workspace: got %q, want %q", b.Workspace, "tag-selected-ws")
 	}
 }
 
