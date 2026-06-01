@@ -1,4 +1,4 @@
-<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/8340088e-2b5b-45bd-a13c-066a5c1821aa" />
+<img width="500" height="500" alt="image" src="https://github.com/user-attachments/assets/8340088e-2b5b-45bd-a13c-066a5c1821aa" />
 
 <p align="center">
   <a href="https://github.com/pandey-raghvendra/osmo/stargazers">
