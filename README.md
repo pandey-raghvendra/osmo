@@ -1,8 +1,26 @@
+<p align="center">
+  <a href="https://github.com/pandey-raghvendra/osmo/stargazers">
+    <img src="https://img.shields.io/github/stars/pandey-raghvendra/osmo?style=social" alt="GitHub Stars"/>
+  </a>
+  <a href="https://github.com/pandey-raghvendra/osmo/releases">
+    <img src="https://img.shields.io/github/v/release/pandey-raghvendra/osmo" alt="Latest Release"/>
+  </a>
+  <a href="https://github.com/pandey-raghvendra/osmo/actions/workflows/ci.yml">
+    <img src="https://github.com/pandey-raghvendra/osmo/actions/workflows/ci.yml/badge.svg" alt="CI"/>
+  </a>
+  <a href="https://goreportcard.com/report/github.com/pandey-raghvendra/osmo">
+    <img src="https://goreportcard.com/badge/github.com/pandey-raghvendra/osmo" alt="Go Report Card"/>
+  </a>
+  <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License"/>
+</p>
+
 # osmo
 
 **Osmosis for your Terraform.** Reality seeps into your config until both sides equalize.
 
 `osmo` detects Terraform drift and rewrites your `.tf` files so that **configuration follows real-world reality** — the *absorb* direction.
+
+> If you find osmo useful, a ⭐ on GitHub helps others discover it.
 
 ---
 
