@@ -1301,3 +1301,36 @@ resource "aws_security_group" "sg" {
 		t.Fatalf("want 1 local-unresolvable unresolved, got %v", unresolved)
 	}
 }
+
+func TestCRLFPreserved(t *testing.T) {
+	dir := t.TempDir()
+	// Write a .tf file with Windows CRLF line endings.
+	crlfContent := "resource \"aws_instance\" \"web\" {\r\n  instance_type = \"t3.micro\"\r\n}\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(crlfContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"constant_value":"t3.micro"}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
+	}}
+
+	changes, _, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	after := changes[0].After
+	if !strings.Contains(string(after), "t3.large") {
+		t.Errorf("drift not absorbed:\n%s", after)
+	}
+	if !strings.Contains(string(after), "\r\n") {
+		t.Errorf("CRLF line endings not preserved in output:\n%q", after)
+	}
+}

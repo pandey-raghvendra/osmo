@@ -471,7 +471,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			changes = append(changes, FileChange{
 				Path:   path,
 				Before: ff.src,
-				After:  ff.f.Bytes(),
+				After:  ff.bytes(),
 				Edits:  buildEdits(editsByPath[path]),
 			})
 		}
@@ -542,6 +542,18 @@ type tfFile struct {
 	src   []byte
 	f     *hclwrite.File
 	dirty bool
+	crlf  bool // original file used CRLF line endings
+}
+
+// bytes returns the formatted HCL, restoring CRLF line endings if the
+// original file used them (hclwrite always emits LF).
+func (tf *tfFile) bytes() []byte {
+	out := tf.f.Bytes()
+	if tf.crlf {
+		out = bytes.ReplaceAll(out, []byte("\r\n"), []byte("\n")) // normalise first
+		out = bytes.ReplaceAll(out, []byte("\n"), []byte("\r\n"))
+	}
+	return out
 }
 
 type dirEditor struct {
@@ -560,11 +572,16 @@ func newDirEditor(dir string) (*dirEditor, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", p, err)
 		}
-		f, diags := hclwrite.ParseConfig(src, p, hcl.Pos{Line: 1, Column: 1})
+		crlf := bytes.Contains(src, []byte("\r\n"))
+		parseSrc := src
+		if crlf {
+			parseSrc = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
+		}
+		f, diags := hclwrite.ParseConfig(parseSrc, p, hcl.Pos{Line: 1, Column: 1})
 		if diags.HasErrors() {
 			return nil, fmt.Errorf("parse %s: %s", p, diags.Error())
 		}
-		de.files[p] = &tfFile{src: src, f: f}
+		de.files[p] = &tfFile{src: src, f: f, crlf: crlf}
 	}
 	return de, nil
 }
