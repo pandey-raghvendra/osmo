@@ -5,19 +5,25 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
+func fmtCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	return ctx
+}
+
 func TestFmt(t *testing.T) {
-	// Deliberately badly indented HCL.
 	ugly := []byte(`resource "aws_instance" "web" {
 instance_type="t3.micro"
   ami="ami-12345"
 }
 `)
-	ctx := context.Background()
-	got, err := Fmt(ctx, "terraform", ugly)
+	got, err := Fmt(fmtCtx(t), "terraform", ugly)
 	if err != nil {
-		t.Skipf("terraform not available: %v", err)
+		t.Skipf("terraform fmt unavailable: %v", err)
 	}
 	if bytes.Equal(got, ugly) {
 		t.Fatal("fmt should have changed the formatting")
@@ -28,16 +34,14 @@ instance_type="t3.micro"
 }
 
 func TestFmtUnchanged(t *testing.T) {
-	// Already formatted HCL should come back byte-for-byte identical.
 	clean := []byte(`resource "aws_instance" "web" {
   instance_type = "t3.micro"
   ami           = "ami-12345"
 }
 `)
-	ctx := context.Background()
-	got, err := Fmt(ctx, "terraform", clean)
+	got, err := Fmt(fmtCtx(t), "terraform", clean)
 	if err != nil {
-		t.Skipf("terraform not available: %v", err)
+		t.Skipf("terraform fmt unavailable: %v", err)
 	}
 	if !bytes.Equal(got, clean) {
 		t.Fatalf("fmt changed already-clean HCL:\nbefore: %s\nafter:  %s", clean, got)

@@ -165,6 +165,9 @@ func Fmt(ctx context.Context, bin string, src []byte) ([]byte, error) {
 	}
 	cmd := exec.CommandContext(ctx, bin, "fmt", "-")
 	cmd.Stdin = bytes.NewReader(src)
+	// CHECKPOINT_DISABLE=1 prevents terraform from phoning home to
+	// check.hashicorp.com on startup, which can hang in restricted CI envs.
+	cmd.Env = append(os.Environ(), "CHECKPOINT_DISABLE=1")
 	out, err := cmd.Output()
 	if err != nil {
 		return src, err
