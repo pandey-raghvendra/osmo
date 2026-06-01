@@ -58,13 +58,13 @@ func TestAbsorbAgainstRealShowJSON(t *testing.T) {
 	drifts := []tfplan.Drift{
 		{
 			Address: "random_string.root", Type: "random_string", Name: "root",
-			Before: map[string]interface{}{"length": float64(8)},
-			After:  map[string]interface{}{"length": float64(12)},
+			Before: tfplan.TFStateFrom(map[string]interface{}{"length": float64(8)}),
+			After:  tfplan.TFStateFrom(map[string]interface{}{"length": float64(12)}),
 		},
 		{
 			Address: "module.pet.random_pet.this", Type: "random_pet", Name: "this",
-			Before: map[string]interface{}{"prefix": "alpha"},
-			After:  map[string]interface{}{"prefix": "beta"},
+			Before: tfplan.TFStateFrom(map[string]interface{}{"prefix": "alpha"}),
+			After:  tfplan.TFStateFrom(map[string]interface{}{"prefix": "beta"}),
 		},
 	}
 

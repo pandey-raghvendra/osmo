@@ -40,12 +40,12 @@ func TestAbsorbAgainstRealResourceDrift(t *testing.T) {
 	if d.Type != "aws_s3_bucket" || d.Name != "drift_test" {
 		t.Errorf("unexpected type/name: %q/%q", d.Type, d.Name)
 	}
-	beforeTags, _ := d.Before["tags"].(map[string]interface{})
-	afterTags, _ := d.After["tags"].(map[string]interface{})
-	if beforeTags["Env"] != "test" {
+	beforeTags, _ := d.Before["tags"].AsObject()
+	afterTags, _ := d.After["tags"].AsObject()
+	if env, _ := beforeTags["Env"].AsString(); env != "test" {
 		t.Errorf("unexpected before.tags: %v", beforeTags)
 	}
-	if afterTags["Managed"] != "manual" {
+	if managed, _ := afterTags["Managed"].AsString(); managed != "manual" {
 		t.Errorf("expected Managed=manual in after.tags: %v", afterTags)
 	}
 

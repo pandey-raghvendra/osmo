@@ -14,12 +14,12 @@ import (
 // Drift describes a single resource whose real-world state diverged from prior
 // Terraform state. Before is what Terraform recorded; After is refreshed reality.
 type Drift struct {
-	Address        string                 // e.g. "aws_instance.web"
-	Type           string                 // e.g. "aws_instance"
-	Name           string                 // e.g. "web"
-	Before         map[string]interface{} // prior state attributes
-	After          map[string]interface{} // refreshed real-world attributes
-	AfterSensitive interface{}            // nil | bool | map[string]interface{}
+	Address        string  // e.g. "aws_instance.web"
+	Type           string  // e.g. "aws_instance"
+	Name           string  // e.g. "web"
+	Before         TFState // prior state attributes
+	After          TFState // refreshed real-world attributes
+	AfterSensitive TFValue // TFNull | TFBool | TFObject with per-attr sensitivity flags
 }
 
 // planJSON is the subset of `terraform show -json` we consume.
@@ -29,9 +29,9 @@ type planJSON struct {
 		Type    string `json:"type"`
 		Name    string `json:"name"`
 		Change  struct {
-			Before         map[string]interface{} `json:"before"`
-			After          map[string]interface{} `json:"after"`
-			AfterSensitive interface{}            `json:"after_sensitive"`
+			Before         TFState `json:"before"`
+			After          TFState `json:"after"`
+			AfterSensitive TFValue `json:"after_sensitive"`
 		} `json:"change"`
 	} `json:"resource_drift"`
 	ResourceChanges []struct {

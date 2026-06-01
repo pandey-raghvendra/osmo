@@ -27,9 +27,9 @@ func TestSensitiveAttrSkipped(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_db_instance.db", Type: "aws_db_instance", Name: "db",
-		Before:         map[string]interface{}{"password": "old-password"},
-		After:          map[string]interface{}{"password": "new-password"},
-		AfterSensitive: map[string]interface{}{"password": true},
+		Before:         tfplan.TFStateFrom(map[string]interface{}{"password": "old-password"}),
+		After:          tfplan.TFStateFrom(map[string]interface{}{"password": "new-password"}),
+		AfterSensitive: tfplan.FromGoValue(map[string]interface{}{"password": true}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -58,8 +58,8 @@ func TestNullAfterValueRemoved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"instance_type": "t3.micro"},
-		After:  map[string]interface{}{"instance_type": nil}, // null = removed in reality
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": nil}), // null = removed in reality
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -96,8 +96,8 @@ func TestAbsentAfterValueRemoved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"instance_type": "t3.micro", "key_name": "my-key"},
-		After:  map[string]interface{}{"instance_type": "t3.micro"}, // key_name absent = deleted from reality
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro", "key_name": "my-key"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}), // key_name absent = deleted from reality
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -132,15 +132,15 @@ func TestNestedSensitiveAttrSkipped(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(50)}},
-		},
-		AfterSensitive: map[string]interface{}{
+		}),
+		AfterSensitive: tfplan.FromGoValue(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": true}},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -179,12 +179,12 @@ func TestNestedNullAfterValueRemoved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": nil}},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -217,12 +217,12 @@ func TestNestedMissingAfterAttrRemoved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20), "volume_type": "gp2"}},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{map[string]interface{}{"volume_type": "gp2"}},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -277,8 +277,8 @@ func TestRootResourceLiteral(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"instance_type": "t3.micro"},
-		After:  map[string]interface{}{"instance_type": "t3.large"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -323,8 +323,8 @@ resource "azurerm_resource_group" "rg" {
 	drifts := []tfplan.Drift{{
 		Address: "module.network.azurerm_resource_group.rg",
 		Type:    "azurerm_resource_group", Name: "rg",
-		Before: map[string]interface{}{"location": "eastus"},
-		After:  map[string]interface{}{"location": "westus"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"location": "eastus"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"location": "westus"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -391,8 +391,8 @@ resource "aws_s3_bucket" "x" {
 	drifts := []tfplan.Drift{{
 		Address: "module.a.module.b.aws_s3_bucket.x",
 		Type:    "aws_s3_bucket", Name: "x",
-		Before: map[string]interface{}{"bucket": "v1"},
-		After:  map[string]interface{}{"bucket": "v2"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"bucket": "v1"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"bucket": "v2"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -426,8 +426,8 @@ func TestUnresolvedLocal(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"instance_type": "t3.micro"},
-		After:  map[string]interface{}{"instance_type": "t3.large"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -462,8 +462,8 @@ func TestUnresolvedRemoteModule(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "module.vpc.aws_vpc.this", Type: "aws_vpc", Name: "this",
-		Before: map[string]interface{}{"cidr_block": "10.0.0.0/16"},
-		After:  map[string]interface{}{"cidr_block": "10.1.0.0/16"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"cidr_block": "10.0.0.0/16"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"cidr_block": "10.1.0.0/16"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -500,8 +500,8 @@ func TestInstancedConstantUnresolved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: `module.n.aws_subnet.s["a"]`, Type: "aws_subnet", Name: "s",
-		Before: map[string]interface{}{"cidr": "10.0.0.0/24"},
-		After:  map[string]interface{}{"cidr": "10.9.0.0/24"},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"cidr": "10.0.0.0/24"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"cidr": "10.9.0.0/24"}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -565,18 +565,18 @@ func TestNestedBlockSingleton(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"instance_type": "t3.micro",
 			"root_block_device": []interface{}{
 				map[string]interface{}{"volume_size": float64(20), "volume_type": "gp2"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"instance_type": "t3.micro",
 			"root_block_device": []interface{}{
 				map[string]interface{}{"volume_size": float64(50), "volume_type": "gp2"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -620,18 +620,18 @@ func TestNestedBlockMultiInstanceMatchByStableAttr(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ebs_block_device": []interface{}{
 				map[string]interface{}{"device_name": "/dev/sda1", "volume_size": float64(20)},
 				map[string]interface{}{"device_name": "/dev/sdb1", "volume_size": float64(100)},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ebs_block_device": []interface{}{
 				map[string]interface{}{"device_name": "/dev/sda1", "volume_size": float64(50)}, // drifted
 				map[string]interface{}{"device_name": "/dev/sdb1", "volume_size": float64(100)},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -678,18 +678,18 @@ func TestNestedBlockSameCountReplacement(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{"name": "old-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 				map[string]interface{}{"name": "stable-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{"name": "new-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 				map[string]interface{}{"name": "stable-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -730,16 +730,16 @@ func TestNamedNestedAttrEditReportsIdentity(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{"name": "api-setting", "port": float64(80), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{"name": "api-setting", "port": float64(8080), "protocol": "Http", "cookie_based_affinity": "Disabled"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -777,7 +777,7 @@ func TestAppGatewayMissingBackendHTTPSettingsProbeNameAdded(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "azurerm_application_gateway.agw", Type: "azurerm_application_gateway", Name: "agw",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{
 					"name": "bhs-adds-apis", "cookie_based_affinity": "Enabled",
@@ -785,8 +785,8 @@ func TestAppGatewayMissingBackendHTTPSettingsProbeNameAdded(t *testing.T) {
 					"protocol": "Https", "request_timeout": float64(30), "probe_name": "",
 				},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"backend_http_settings": []interface{}{
 				map[string]interface{}{
 					"name": "bhs-adds-apis", "cookie_based_affinity": "Enabled",
@@ -794,7 +794,7 @@ func TestAppGatewayMissingBackendHTTPSettingsProbeNameAdded(t *testing.T) {
 					"protocol": "Https", "request_timeout": float64(30), "probe_name": "probe-adds-apis-path",
 				},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -837,18 +837,18 @@ func TestNestedBlockCollectionAmbiguousPairingUnresolved(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "protocol": "tcp"},
 				map[string]interface{}{"from_port": float64(443), "protocol": "tcp"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "protocol": "udp"},
 				map[string]interface{}{"from_port": float64(80), "protocol": "http"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -882,8 +882,8 @@ resource "aws_instance" "web" {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_instance.web", Type: "aws_instance", Name: "web",
-		Before: map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}}},
-		After:  map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(50)}}},
+		Before: tfplan.TFStateFrom(map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(20)}}}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"root_block_device": []interface{}{map[string]interface{}{"volume_size": float64(50)}}}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -937,16 +937,16 @@ resource "aws_instance" "web" {
 	drifts := []tfplan.Drift{{
 		Address: "module.app.aws_instance.web",
 		Type:    "aws_instance", Name: "web",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{
 				map[string]interface{}{"volume_size": float64(20)},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"root_block_device": []interface{}{
 				map[string]interface{}{"volume_size": float64(50)},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -989,17 +989,17 @@ func TestNestedBlockAdd(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -1045,17 +1045,17 @@ func TestNestedBlockRemove(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -1103,7 +1103,7 @@ func TestDeepNestedBlock(t *testing.T) {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_s3_bucket.b", Type: "aws_s3_bucket", Name: "b",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"bucket": "my-bucket",
 			"server_side_encryption_configuration": []interface{}{
 				map[string]interface{}{
@@ -1120,8 +1120,8 @@ func TestDeepNestedBlock(t *testing.T) {
 					},
 				},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"bucket": "my-bucket",
 			"server_side_encryption_configuration": []interface{}{
 				map[string]interface{}{
@@ -1138,7 +1138,7 @@ func TestDeepNestedBlock(t *testing.T) {
 					},
 				},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -1207,17 +1207,17 @@ resource "aws_security_group" "sg" {
 	drifts := []tfplan.Drift{{
 		Address: "module.sg.aws_security_group.sg",
 		Type:    "aws_security_group", Name: "sg",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
@@ -1277,17 +1277,17 @@ resource "aws_security_group" "sg" {
 	}}}`
 	drifts := []tfplan.Drift{{
 		Address: "aws_security_group.sg", Type: "aws_security_group", Name: "sg",
-		Before: map[string]interface{}{
+		Before: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 			},
-		},
-		After: map[string]interface{}{
+		}),
+		After: tfplan.TFStateFrom(map[string]interface{}{
 			"ingress": []interface{}{
 				map[string]interface{}{"from_port": float64(80), "to_port": float64(80), "protocol": "tcp"},
 				map[string]interface{}{"from_port": float64(443), "to_port": float64(443), "protocol": "tcp"},
 			},
-		},
+		}),
 	}}
 
 	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))

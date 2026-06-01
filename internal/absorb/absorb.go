@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"sort"
 	"strings"
 
@@ -57,8 +56,8 @@ type FileChange struct {
 // attr scoring).
 type BlockStep struct {
 	BlockType string
-	Before    map[string]interface{}
-	Drifted   map[string]interface{}
+	Before    tfplan.TFState
+	Drifted   tfplan.TFState
 }
 
 // BlockAttrEdit is a leaf-level scalar attribute change inside a nested block
@@ -72,7 +71,7 @@ type BlockAttrEdit struct {
 	ResMode   string
 	Steps     []BlockStep
 	Attr      string
-	Value     interface{}
+	Value     tfplan.TFValue
 }
 
 // BlockAttrRemove is a leaf-level scalar attribute removal inside a nested
@@ -97,8 +96,8 @@ type BlockStructuralChange struct {
 	ResMode   string
 	Steps     []BlockStep
 	BlockType string
-	Added     []map[string]interface{}
-	Removed   []map[string]interface{}
+	Added     []tfplan.TFState
+	Removed   []tfplan.TFState
 }
 
 // DynamicBlockUpdate is emitted for every slice (nested-block) attribute in a
@@ -112,9 +111,9 @@ type DynamicBlockUpdate struct {
 	ResType   string
 	ResName   string
 	ResMode   string
-	Steps     []BlockStep              // path to the body containing the dynamic block
-	BlockType string                   // the dynamic block's label, e.g. "ingress"
-	AfterFull []map[string]interface{} // complete after-state of this block type
+	Steps     []BlockStep      // path to the body containing the dynamic block
+	BlockType string           // the dynamic block's label, e.g. "ingress"
+	AfterFull []tfplan.TFState // complete after-state of this block type
 }
 
 // ---- Plan ---------------------------------------------------------------
@@ -184,14 +183,14 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		// Scalar top-level attrs → provenance trace.
 		for k, av := range d.After {
 			bv := d.Before[k]
-			if reflect.DeepEqual(bv, av) {
+			if bv.Equal(av) {
 				continue
 			}
-			if _, isSlice := av.([]interface{}); isSlice {
+			if av.IsList() {
 				continue // handled by walkDriftMap below
 			}
 			// Null after-value: attr removed from reality → remove from config.
-			if av == nil {
+			if av.IsNull() {
 				scalarRemoveOps = append(scalarRemoveOps, scalarRemoveOp{addr, d.Address, k})
 				continue
 			}
@@ -203,7 +202,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 				})
 				continue
 			}
-			t, u := provenance.Trace(root, addr, k, av)
+			t, u := provenance.Trace(root, addr, k, av.GoValue())
 			if u != nil {
 				unresolved = append(unresolved, *u)
 				continue
@@ -215,10 +214,10 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 			if _, inAfter := d.After[k]; inAfter {
 				continue
 			}
-			if reflect.DeepEqual(bv, nil) {
+			if bv.IsNull() {
 				continue
 			}
-			if _, isSlice := bv.([]interface{}); isSlice {
+			if bv.IsList() {
 				continue // structural removal handled by walkDriftMap
 			}
 			scalarRemoveOps = append(scalarRemoveOps, scalarRemoveOp{addr, d.Address, k})
@@ -496,16 +495,16 @@ func buildEdits(byAddr map[string]map[string]bool) []ResourceEdit {
 }
 
 // changedAttrs returns keys whose value differs between before and after.
-func changedAttrs(before, after map[string]interface{}) map[string]interface{} {
-	changed := map[string]interface{}{}
+func changedAttrs(before, after tfplan.TFState) tfplan.TFState {
+	changed := tfplan.TFState{}
 	for k, av := range after {
-		if bv, ok := before[k]; !ok || !reflect.DeepEqual(bv, av) {
+		if bv, ok := before[k]; !ok || !bv.Equal(av) {
 			changed[k] = av
 		}
 	}
 	for k := range before {
 		if _, ok := after[k]; !ok {
-			changed[k] = nil
+			changed[k] = tfplan.TFValue{} // TFNull — key removed
 		}
 	}
 	return changed
@@ -674,22 +673,22 @@ func walkDriftMap(
 	addr address.Addr,
 	driftAddr string,
 	path []BlockStep,
-	before, after map[string]interface{},
-	afterSensitive interface{},
+	before, after tfplan.TFState,
+	afterSensitive tfplan.TFValue,
 ) (edits []BlockAttrEdit, removes []BlockAttrRemove, structs []BlockStructuralChange, dynUpdates []DynamicBlockUpdate, unresolved []provenance.Unresolved) {
 	for k, av := range after {
 		bv := before[k]
-		if reflect.DeepEqual(bv, av) {
+		if bv.Equal(av) {
 			continue
 		}
 		qualAttr := qualifiedAttr(path, k)
-		afterSlice, isSlice := av.([]interface{})
-		if !isSlice {
+		afterList, isList := av.AsList()
+		if !isList {
 			if len(path) == 0 {
 				// Root-level scalar: handled via provenance in Plan.
 				continue
 			}
-			if av == nil {
+			if av.IsNull() {
 				// Explicit null in after = attr removed from reality; treat same as absent key.
 				removes = append(removes, BlockAttrRemove{
 					DriftAddr: driftAddr,
@@ -721,10 +720,13 @@ func walkDriftMap(
 			continue
 		}
 
-		// Nested block (slice value).
-		beforeSlice, _ := bv.([]interface{})
-		bMaps := toMapSlice(beforeSlice)
-		aMaps := toMapSlice(afterSlice)
+		// Nested block (list value).
+		var beforeList []tfplan.TFValue
+		if bl, ok := bv.AsList(); ok {
+			beforeList = bl
+		}
+		bMaps := toStateSlice(beforeList)
+		aMaps := toStateSlice(afterList)
 		sensitiveElems := sensitiveSlice(afterSensitive, k)
 
 		if hasSensitiveValue(sensitiveElems) {
@@ -733,8 +735,6 @@ func walkDriftMap(
 				Reason: "sensitive value — cannot absorb dynamic block collection into plain-text config",
 			})
 		} else {
-			// Always emit a DynamicBlockUpdate for the full after collection.
-			// applyDynamicBlockUpdate is a no-op for literal (non-dynamic) blocks.
 			dynUpdates = append(dynUpdates, DynamicBlockUpdate{
 				DriftAddr: driftAddr,
 				ResType:   addr.Type,
@@ -746,10 +746,6 @@ func walkDriftMap(
 			})
 		}
 
-		// Match before↔after pairs by identity/similarity even when counts are
-		// equal. Terraform providers commonly model nested blocks as sets; Azure
-		// Application Gateway is a practical example where positional matching
-		// turns delete/create drift into misleading scalar edits.
 		matches, addedIdx, removedIdx, matchErr := matchBlockElements(idreg, addr.Type, blockPath(path, k), bMaps, aMaps)
 		if matchErr != nil {
 			unresolved = append(unresolved, provenance.Unresolved{
@@ -759,7 +755,7 @@ func walkDriftMap(
 			continue
 		}
 		if len(addedIdx) > 0 || len(removedIdx) > 0 {
-			var added, removed []map[string]interface{}
+			var added, removed []tfplan.TFState
 			for _, i := range addedIdx {
 				if hasSensitiveValue(sensitiveAt(sensitiveElems, i)) {
 					unresolved = append(unresolved, provenance.Unresolved{
@@ -808,8 +804,8 @@ func walkDriftMap(
 			// Root-level removals are not edited automatically.
 			continue
 		}
-		beforeSlice, isSlice := bv.([]interface{})
-		if !isSlice {
+		beforeList, isList := bv.AsList()
+		if !isList {
 			removes = append(removes, BlockAttrRemove{
 				DriftAddr: driftAddr,
 				ResType:   addr.Type,
@@ -820,12 +816,11 @@ func walkDriftMap(
 			})
 			continue
 		}
-		bMaps := toMapSlice(beforeSlice)
+		bMaps := toStateSlice(beforeList)
 		dynUpdates = append(dynUpdates, DynamicBlockUpdate{
 			DriftAddr: driftAddr,
 			ResType:   addr.Type,
-			ResName:   addr.Name,
-			ResMode:   addr.Mode,
+			ResName:   addr.Mode,
 			Steps:     path,
 			BlockType: k,
 			AfterFull: nil,
@@ -846,7 +841,7 @@ func walkDriftMap(
 // matchBlockElements greedily matches before elements to after elements by
 // attribute similarity, returning matched index pairs, unmatched after indices
 // (added), and unmatched before indices (removed).
-func matchBlockElements(idreg *blockid.Registry, resourceType string, path []string, before, after []map[string]interface{}) (matches [][2]int, added, removed []int, err error) {
+func matchBlockElements(idreg *blockid.Registry, resourceType string, path []string, before, after []tfplan.TFState) (matches [][2]int, added, removed []int, err error) {
 	if len(before) == 1 && len(after) == 1 && !hasDifferentNameIdentity(before[0], after[0]) {
 		return [][2]int{{0, 0}}, nil, nil, nil
 	}
@@ -868,7 +863,6 @@ func matchBlockElements(idreg *blockid.Registry, resourceType string, path []str
 				ties++
 			}
 		}
-		// Accept the match only if at least one key matches.
 		if bestAi >= 0 && bestScore > 0 {
 			if ties > 1 {
 				return nil, nil, nil, fmt.Errorf("ambiguous nested block collection match: before element %d matched multiple after elements equally", bi)
@@ -887,8 +881,7 @@ func matchBlockElements(idreg *blockid.Registry, resourceType string, path []str
 	return
 }
 
-// mapMatchScore counts keys with equal values between two maps (deep equal).
-func mapMatchScore(a, b map[string]interface{}, identity []string) int {
+func mapMatchScore(a, b tfplan.TFState, identity []string) int {
 	if len(identity) > 0 {
 		return identityMatchScore(a, b, identity)
 	}
@@ -897,14 +890,14 @@ func mapMatchScore(a, b map[string]interface{}, identity []string) int {
 	}
 	score := 0
 	for k, av := range a {
-		if bv, ok := b[k]; ok && reflect.DeepEqual(av, bv) {
+		if bv, ok := b[k]; ok && bv.Equal(av) {
 			score++
 		}
 	}
 	return score
 }
 
-func identityMatchScore(a, b map[string]interface{}, keys []string) int {
+func identityMatchScore(a, b tfplan.TFState, keys []string) int {
 	score := 0
 	for _, k := range keys {
 		av, aOK := a[k]
@@ -912,7 +905,7 @@ func identityMatchScore(a, b map[string]interface{}, keys []string) int {
 		if !aOK || !bOK {
 			continue
 		}
-		if !reflect.DeepEqual(av, bv) {
+		if !bv.Equal(av) {
 			return 0
 		}
 		score += 100
@@ -923,10 +916,10 @@ func identityMatchScore(a, b map[string]interface{}, keys []string) int {
 	return score
 }
 
-func hasDifferentNameIdentity(a, b map[string]interface{}) bool {
+func hasDifferentNameIdentity(a, b tfplan.TFState) bool {
 	av, aOK := a["name"]
 	bv, bOK := b["name"]
-	return aOK && bOK && !reflect.DeepEqual(av, bv)
+	return aOK && bOK && !av.Equal(bv)
 }
 
 func canAddMissingNestedAttr(edit BlockAttrEdit) bool {
@@ -956,24 +949,16 @@ func blockPath(steps []BlockStep, next string) []string {
 	return append(path, next)
 }
 
-func toMapSlice(slice []interface{}) []map[string]interface{} {
-	result := make([]map[string]interface{}, 0, len(slice))
-	for _, v := range slice {
-		if m, ok := v.(map[string]interface{}); ok {
-			result = append(result, m)
+func toStateSlice(list []tfplan.TFValue) []tfplan.TFState {
+	result := make([]tfplan.TFState, 0, len(list))
+	for _, v := range list {
+		if obj, ok := v.AsObject(); ok {
+			result = append(result, obj)
 		}
 	}
 	return result
 }
 
-// applyBlockAttrEdit navigates to the nested block described by edit.Steps and
-// rewrites the attribute. When the attribute is a variable reference rather than
-// a literal, it calls provenance.TraceNested (using the configuration tree in
-// root) and returns a redirect Target for Plan() to apply via the right dirEditor.
-//
-// Returns (path, qualAttr, redirect, unresolved):
-//   - redirect non-nil: caller must apply the Target (may be in a different dir).
-//   - u non-nil: attribute could not be absorbed.
 func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module) (path, qualAttr string, redirect *provenance.Target, u *provenance.Unresolved) {
 	outerType := "resource"
 	if edit.ResMode == "data" {
@@ -999,7 +984,7 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module)
 		}
 		if targetBody.GetAttribute(edit.Attr) == nil {
 			if canAddMissingNestedAttr(edit) {
-				newVal, ctyErr := toCty(edit.Value)
+				newVal, ctyErr := toCty(edit.Value.GoValue())
 				if ctyErr != nil {
 					return p, qualAttr, nil, &provenance.Unresolved{
 						Address: edit.DriftAddr, Attr: qualAttr, Reason: ctyErr.Error(),
@@ -1021,7 +1006,7 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module)
 					for i, s := range edit.Steps {
 						blockPath[i] = s.BlockType
 					}
-					tgt, tu := provenance.TraceNested(root, addr, blockPath, edit.Attr, edit.Value)
+					tgt, tu := provenance.TraceNested(root, addr, blockPath, edit.Attr, edit.Value.GoValue())
 					if tu != nil {
 						return p, qualAttr, nil, tu
 					}
@@ -1033,7 +1018,7 @@ func (de *dirEditor) applyBlockAttrEdit(edit BlockAttrEdit, root *config.Module)
 				Reason: "nested block attr is a variable reference; cannot parse drift address for tracing",
 			}
 		}
-		newVal, ctyErr := toCty(edit.Value)
+		newVal, ctyErr := toCty(edit.Value.GoValue())
 		if ctyErr != nil {
 			return p, qualAttr, nil, &provenance.Unresolved{
 				Address: edit.DriftAddr, Attr: qualAttr, Reason: ctyErr.Error(),
@@ -1115,7 +1100,7 @@ func (de *dirEditor) applyBlockStructChange(sc BlockStructuralChange) (path stri
 
 		// Remove blocks that disappeared out-of-band.
 		for _, bm := range sc.Removed {
-			block, matchErr := findMatchingNestedBlock(parentBody, sc.BlockType, bm, map[string]interface{}{})
+			block, matchErr := findMatchingNestedBlock(parentBody, sc.BlockType, bm, tfplan.TFState{})
 			if matchErr != nil {
 				unresolved = append(unresolved, provenance.Unresolved{
 					Address: sc.DriftAddr, Attr: sc.BlockType,
@@ -1172,7 +1157,7 @@ func navigateNestedPath(root *hclwrite.Body, steps []BlockStep) (*hclwrite.Body,
 func findMatchingNestedBlock(
 	body *hclwrite.Body,
 	blockType string,
-	before, drifted map[string]interface{},
+	before, drifted tfplan.TFState,
 ) (*hclwrite.Block, error) {
 	var candidates []*hclwrite.Block
 	for _, b := range body.Blocks() {
@@ -1186,7 +1171,7 @@ func findMatchingNestedBlock(
 	case 1:
 		return candidates[0], nil
 	default:
-		stable := make(map[string]interface{}, len(before))
+		stable := make(tfplan.TFState, len(before))
 		for k, v := range before {
 			if _, isDrifted := drifted[k]; !isDrifted {
 				stable[k] = v
@@ -1217,7 +1202,7 @@ func findMatchingNestedBlock(
 
 // bodyMatchScore counts how many stable attrs have matching literal values in
 // the block body. Comparison is JSON-marshal-based for type safety.
-func bodyMatchScore(body *hclwrite.Body, stableAttrs map[string]interface{}) int {
+func bodyMatchScore(body *hclwrite.Body, stableAttrs tfplan.TFState) int {
 	score := 0
 	for attr, expected := range stableAttrs {
 		if body.GetAttribute(attr) == nil {
@@ -1225,9 +1210,9 @@ func bodyMatchScore(body *hclwrite.Body, stableAttrs map[string]interface{}) int
 		}
 		curCty, err := evalBodyAttr(body, attr)
 		if err != nil {
-			continue // var ref or expression — can't compare
+			continue
 		}
-		expCty, err := toCty(expected)
+		expCty, err := toCty(expected.GoValue())
 		if err != nil {
 			continue
 		}
@@ -1244,10 +1229,9 @@ func isAmbiguousNestedMatch(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "ambiguous nested block")
 }
 
-// generateHCLBlock creates an hclwrite.Block from a JSON-decoded attribute map.
-// Slice values are treated as nested blocks (recursed); all other non-nil
-// values are emitted as literal attributes.
-func generateHCLBlock(blockType string, attrs map[string]interface{}) *hclwrite.Block {
+// generateHCLBlock creates an hclwrite.Block from a TFState attribute map.
+// List values are treated as nested blocks (recursed); all others are scalars.
+func generateHCLBlock(blockType string, attrs tfplan.TFState) *hclwrite.Block {
 	b := hclwrite.NewBlock(blockType, nil)
 	keys := make([]string, 0, len(attrs))
 	for k := range attrs {
@@ -1256,18 +1240,18 @@ func generateHCLBlock(blockType string, attrs map[string]interface{}) *hclwrite.
 	sort.Strings(keys)
 	for _, k := range keys {
 		v := attrs[k]
-		if v == nil {
+		if v.IsNull() {
 			continue
 		}
-		if slice, ok := v.([]interface{}); ok {
-			for _, elem := range slice {
-				if m, ok := elem.(map[string]interface{}); ok {
-					b.Body().AppendBlock(generateHCLBlock(k, m))
+		if list, ok := v.AsList(); ok {
+			for _, elem := range list {
+				if obj, ok := elem.AsObject(); ok {
+					b.Body().AppendBlock(generateHCLBlock(k, obj))
 				}
 			}
 			continue
 		}
-		if ctyVal, err := toCty(v); err == nil {
+		if ctyVal, err := toCty(v.GoValue()); err == nil {
 			b.Body().SetAttributeValue(k, ctyVal)
 		}
 	}
@@ -1397,11 +1381,15 @@ func isDynamicAtPath(root *hclwrite.Body, steps []BlockStep) bool {
 	return false
 }
 
-// mapsToInterfaceSlice converts []map[string]interface{} to []interface{}.
-func mapsToInterfaceSlice(maps []map[string]interface{}) []interface{} {
+// mapsToInterfaceSlice converts []TFState to []interface{} for provenance.TraceForEach.
+func mapsToInterfaceSlice(maps []tfplan.TFState) []interface{} {
 	result := make([]interface{}, len(maps))
 	for i, m := range maps {
-		result[i] = m
+		obj := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			obj[k] = v.GoValue()
+		}
+		result[i] = obj
 	}
 	return result
 }
@@ -1421,7 +1409,7 @@ func qualifiedAttr(steps []BlockStep, attr string) string {
 
 func blockStepLabel(step BlockStep) string {
 	if name, ok := step.Before["name"]; ok {
-		if s, ok := name.(string); ok && s != "" {
+		if s, strOK := name.AsString(); strOK && s != "" {
 			return step.BlockType + "[" + quoteHCLString(s) + "]"
 		}
 	}
@@ -1475,71 +1463,79 @@ func evalAttr(block *hclwrite.Block, attr string) (cty.Value, error) {
 // We guard conservatively: skip only when the attr's entry is exactly the
 // boolean true. An empty map {}, false, or a nested map means the top-level
 // attr value is not wholly sensitive and can be absorbed safely.
-func isSensitiveAttr(afterSensitive interface{}, attr string) bool {
-	if afterSensitive == nil {
+func isSensitiveAttr(afterSensitive tfplan.TFValue, attr string) bool {
+	if afterSensitive.IsNull() {
 		return false
 	}
-	// Whole resource marked sensitive.
-	if b, ok := afterSensitive.(bool); ok {
+	if b, ok := afterSensitive.AsBool(); ok {
 		return b
 	}
-	m, ok := afterSensitive.(map[string]interface{})
+	obj, ok := afterSensitive.AsObject()
 	if !ok {
 		return false
 	}
-	v := m[attr]
-	b, ok := v.(bool)
-	return ok && b // only true when the attr is explicitly marked true
+	v := obj[attr]
+	b, ok := v.AsBool()
+	return ok && b
 }
 
-func isSensitiveNested(afterSensitive interface{}, attr string) bool {
-	if afterSensitive == nil {
+func isSensitiveNested(afterSensitive tfplan.TFValue, attr string) bool {
+	if afterSensitive.IsNull() {
 		return false
 	}
-	if b, ok := afterSensitive.(bool); ok {
+	if b, ok := afterSensitive.AsBool(); ok {
 		return b
 	}
-	m, ok := afterSensitive.(map[string]interface{})
+	obj, ok := afterSensitive.AsObject()
 	if !ok {
 		return false
 	}
-	return hasSensitiveValue(m[attr])
+	return hasSensitiveValue(obj[attr])
 }
 
-func sensitiveSlice(afterSensitive interface{}, attr string) []interface{} {
-	if afterSensitive == nil {
-		return nil
+// sensitiveSlice returns the sensitivity descriptor for a slice attribute.
+// Result is a TFList of per-element sensitivity flags, or TFBool(true) if the
+// entire attribute is sensitive, or TFNull if not sensitive.
+func sensitiveSlice(afterSensitive tfplan.TFValue, attr string) tfplan.TFValue {
+	if afterSensitive.IsNull() {
+		return tfplan.TFValue{}
 	}
-	if b, ok := afterSensitive.(bool); ok && b {
-		return []interface{}{true}
+	if b, ok := afterSensitive.AsBool(); ok && b {
+		return tfplan.TFBoolVal(true)
 	}
-	m, ok := afterSensitive.(map[string]interface{})
+	obj, ok := afterSensitive.AsObject()
 	if !ok {
-		return nil
+		return tfplan.TFValue{}
 	}
-	s, _ := m[attr].([]interface{})
-	return s
+	return obj[attr]
 }
 
-func sensitiveAt(s []interface{}, i int) interface{} {
-	if i < 0 || i >= len(s) {
-		return nil
+// sensitiveAt returns the sensitivity descriptor for element i of a slice
+// sensitivity value returned by sensitiveSlice.
+func sensitiveAt(s tfplan.TFValue, i int) tfplan.TFValue {
+	list, ok := s.AsList()
+	if !ok {
+		return s // TFBool(true) → entire collection sensitive
 	}
-	return s[i]
+	if i < 0 || i >= len(list) {
+		return tfplan.TFValue{}
+	}
+	return list[i]
 }
 
-func hasSensitiveValue(v interface{}) bool {
-	switch x := v.(type) {
-	case bool:
-		return x
-	case map[string]interface{}:
-		for _, child := range x {
+func hasSensitiveValue(v tfplan.TFValue) bool {
+	if b, ok := v.AsBool(); ok {
+		return b
+	}
+	if obj, ok := v.AsObject(); ok {
+		for _, child := range obj {
 			if hasSensitiveValue(child) {
 				return true
 			}
 		}
-	case []interface{}:
-		for _, child := range x {
+	}
+	if list, ok := v.AsList(); ok {
+		for _, child := range list {
 			if hasSensitiveValue(child) {
 				return true
 			}
