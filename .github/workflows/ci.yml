@@ -18,11 +18,16 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1"
+
       - name: Build
         run: go build ./...
 
-      - name: Test
-        run: go test ./internal/absorb/... ./internal/address/...
-
       - name: Vet
         run: go vet ./...
+
+      - name: Test
+        run: go test ./...

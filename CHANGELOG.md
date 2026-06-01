@@ -11,6 +11,24 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.0] - 2026-06-01
+
+### Added
+- **`terraform fmt` post-absorb**: each changed file piped through
+  `terraform fmt -` in-memory before diffs are shown and before writing.
+  Both diff output and written files are fmt-clean. Non-fatal on failure.
+- **Stars/release/CI/Go Report Card badges** in README.
+- CI now runs `go test ./...` (all packages) with Terraform available in
+  the runner. Previously only `internal/absorb` and `internal/address` ran.
+- Release workflow runs full test suite before GoReleaser.
+
+### Changed
+- Version bumped to 1.0.0: core absorption engine, verify+rollback,
+  selective absorption, JSON output, extensible block identity registry,
+  deletion handling, and project config file are all stable.
+
+---
+
 ## [0.1.6] - 2026-06-01
 
 ### Added
