@@ -34,6 +34,12 @@ type planJSON struct {
 			AfterSensitive interface{}            `json:"after_sensitive"`
 		} `json:"change"`
 	} `json:"resource_drift"`
+	ResourceChanges []struct {
+		Address string `json:"address"`
+		Change  struct {
+			Actions []string `json:"actions"`
+		} `json:"change"`
+	} `json:"resource_changes"`
 }
 
 // Detect runs a refresh-only plan in dir and returns detected drift.
@@ -92,6 +98,62 @@ func ParseDrift(raw []byte) ([]Drift, error) {
 		})
 	}
 	return drifts, nil
+}
+
+// PlannedChanges runs a normal (config-driven) plan in dir and returns the
+// addresses Terraform would still act on, i.e. resources whose actions are not
+// purely "no-op"/"read". After osmo absorbs drift into config, a converged
+// resource has no actionable change here; a still-actionable address means the
+// config does not yet match reality.
+func PlannedChanges(ctx context.Context, dir, terraformBin string) ([]string, error) {
+	if terraformBin == "" {
+		terraformBin = "terraform"
+	}
+
+	planFile, err := os.CreateTemp(dir, "verify-*.tfplan")
+	if err != nil {
+		return nil, fmt.Errorf("create temp plan file: %w", err)
+	}
+	planPath := planFile.Name()
+	planFile.Close()
+	defer os.Remove(planPath)
+
+	if err := run(ctx, dir, terraformBin,
+		"plan", "-input=false", "-no-color",
+		"-out="+filepath.Base(planPath)); err != nil {
+		return nil, fmt.Errorf("terraform plan: %w", err)
+	}
+
+	raw, err := output(ctx, dir, terraformBin,
+		"show", "-json", filepath.Base(planPath))
+	if err != nil {
+		return nil, fmt.Errorf("terraform show -json: %w", err)
+	}
+
+	var pj planJSON
+	if err := json.Unmarshal(raw, &pj); err != nil {
+		return nil, fmt.Errorf("parse plan json: %w", err)
+	}
+	var actionable []string
+	for _, rc := range pj.ResourceChanges {
+		if isActionable(rc.Change.Actions) {
+			actionable = append(actionable, rc.Address)
+		}
+	}
+	return actionable, nil
+}
+
+// isActionable reports whether a plan action set represents real work. Empty,
+// ["no-op"], and ["read"] are not actionable; anything else is.
+func isActionable(actions []string) bool {
+	for _, a := range actions {
+		switch a {
+		case "no-op", "read":
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 func run(ctx context.Context, dir, bin string, args ...string) error {

@@ -21,8 +21,8 @@ osmo -dir ./infra
 # Apply changes to disk
 osmo -dir ./infra -write
 
-# Verify drift is resolved
-terraform -chdir=./infra plan   # should show: No changes
+# Apply, then prove it: re-plan and roll back if drift remains
+osmo -dir ./infra -write -verify
 ```
 
 | Flag | Default | Meaning |
@@ -30,7 +30,55 @@ terraform -chdir=./infra plan   # should show: No changes
 | `-dir` | `.` | Terraform working directory |
 | `-terraform` | `terraform` | Terraform binary path |
 | `-write` | `false` | Write changes to disk (else diff only) |
+| `-verify` | `false` | After writing, run a normal plan; roll back files if any absorbed resource still has a planned change (requires `-write`; not usable with `-plan-json`) |
+| `-approve` | `false` | Interactively approve each file change before writing (requires `-write`) |
+| `-target` | `` | Only absorb drift on this resource address (repeatable / comma-separated) |
+| `-exclude` | `` | Skip drift on this resource address (repeatable / comma-separated; wins over `-target`) |
 | `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
+
+---
+
+## Verify: closed-loop convergence
+
+osmo rewrites your source of truth, so it should prove the rewrite actually
+resolved the drift. `-verify` runs a normal `terraform plan` after writing —
+absorb edits config to match reality, so a converged resource has **no planned
+change**:
+
+- no absorbed resource has a planned change → success
+- a planned change **remains** on any absorbed resource → all written files are
+  **rolled back** to their pre-absorb content and osmo exits non-zero
+
+```sh
+osmo -dir ./infra -write -verify
+```
+
+This guards against a wrong provenance trace or block match silently
+corrupting config — osmo never leaves you with edits it can't prove converge.
+`-verify` needs a live plan, so it is incompatible with `-plan-json`.
+
+---
+
+## Selective absorption: triage before you codify
+
+Drift is not always a legitimate hotfix — it can be an unauthorized or
+malicious change. Absorbing it blindly would launder that change into your
+source of truth. Use selection + approval to keep a human in the loop:
+
+```sh
+# Only absorb a known-good resource
+osmo -dir ./infra -write -target aws_instance.web
+
+# Absorb everything except a suspicious change you want to investigate/revert
+osmo -dir ./infra -write -exclude aws_security_group.public
+
+# Review and approve each file change interactively
+osmo -dir ./infra -write -approve
+```
+
+`-target`/`-exclude` match modules and indexed instances by prefix:
+`module.app` matches `module.app.aws_instance.web`, and `aws_instance.web`
+matches `aws_instance.web[0]`. `-exclude` always wins over `-target`.
 
 ---
 
