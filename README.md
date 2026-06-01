@@ -134,6 +134,37 @@ matches `aws_instance.web[0]`. `-exclude` always wins over `-target`.
 
 ---
 
+## Project config: `.osmo.json`
+
+Place `.osmo.json` in the Terraform working directory to extend or override
+built-in block identity keys. Identity keys tell osmo how to match set-typed
+nested blocks by a stable attribute rather than by position, preventing false
+diffs when provider semantics change element ordering.
+
+```json
+{
+  "block_identity": {
+    "google_compute_firewall.allow": ["protocol"],
+    "azurerm_lb.backend_address_pool": ["name"],
+    "my_custom_resource.my_block": ["id", "name"]
+  }
+}
+```
+
+Map key format: `"<resource_type>.<block_type>"`. User entries override built-ins.
+
+**Built-in registry** (no config needed):
+
+| Resource | Block | Identity key |
+|---|---|---|
+| `azurerm_application_gateway` | all named sub-blocks | `name` |
+| `azurerm_lb` | `frontend_ip_configuration` | `name` |
+| `google_compute_firewall` | `allow`, `deny` | `protocol` |
+| `google_compute_backend_service` | `backend` | `group` |
+| `google_container_cluster` | `node_pool` | `name` |
+
+---
+
 ## How it works
 
 ```

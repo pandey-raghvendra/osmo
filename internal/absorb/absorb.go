@@ -25,6 +25,7 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/pandey-raghvendra/osmo/internal/address"
+	"github.com/pandey-raghvendra/osmo/internal/blockid"
 	"github.com/pandey-raghvendra/osmo/internal/config"
 	"github.com/pandey-raghvendra/osmo/internal/provenance"
 	"github.com/pandey-raghvendra/osmo/internal/tfplan"
@@ -128,6 +129,11 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		return nil, nil, err
 	}
 
+	idreg, err := blockid.Load(baseDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load %s: %w", blockid.ConfigFile, err)
+	}
+
 	var unresolved []provenance.Unresolved
 
 	type scalarOp struct {
@@ -223,7 +229,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 		// BlockAttrEdits for nested literals, BlockStructuralChanges for
 		// count-change events, and DynamicBlockUpdates for every slice attr
 		// (used if the block type is implemented with a `dynamic` block).
-		blockEdits, blockRemoves, blockStructs, blockDynUpdates, blockUnresolved := walkDriftMap(addr, d.Address, nil, d.Before, d.After, d.AfterSensitive)
+		blockEdits, blockRemoves, blockStructs, blockDynUpdates, blockUnresolved := walkDriftMap(idreg, addr, d.Address, nil, d.Before, d.After, d.AfterSensitive)
 		unresolved = append(unresolved, blockUnresolved...)
 		for _, e := range blockEdits {
 			nestedAttrOps = append(nestedAttrOps, nestedAttrOp{addr, e})
@@ -664,6 +670,7 @@ func setAttr(block *hclwrite.Block, attr string, value interface{}, key *string)
 // Root-level scalar attrs (path == nil) are skipped because those go through
 // the provenance path in Plan.
 func walkDriftMap(
+	idreg *blockid.Registry,
 	addr address.Addr,
 	driftAddr string,
 	path []BlockStep,
@@ -743,7 +750,7 @@ func walkDriftMap(
 		// equal. Terraform providers commonly model nested blocks as sets; Azure
 		// Application Gateway is a practical example where positional matching
 		// turns delete/create drift into misleading scalar edits.
-		matches, addedIdx, removedIdx, matchErr := matchBlockElements(addr.Type, blockPath(path, k), bMaps, aMaps)
+		matches, addedIdx, removedIdx, matchErr := matchBlockElements(idreg, addr.Type, blockPath(path, k), bMaps, aMaps)
 		if matchErr != nil {
 			unresolved = append(unresolved, provenance.Unresolved{
 				Address: driftAddr, Attr: qualAttr,
@@ -785,7 +792,7 @@ func walkDriftMap(
 			}
 			newStep := BlockStep{BlockType: k, Before: bm, Drifted: drifted}
 			newPath := append(append([]BlockStep(nil), path...), newStep)
-			subEdits, subRemoves, subStructs, subDyn, subUnresolved := walkDriftMap(addr, driftAddr, newPath, bm, am, sensitiveAt(sensitiveElems, pair[1]))
+			subEdits, subRemoves, subStructs, subDyn, subUnresolved := walkDriftMap(idreg, addr, driftAddr, newPath, bm, am, sensitiveAt(sensitiveElems, pair[1]))
 			edits = append(edits, subEdits...)
 			removes = append(removes, subRemoves...)
 			structs = append(structs, subStructs...)
@@ -839,11 +846,11 @@ func walkDriftMap(
 // matchBlockElements greedily matches before elements to after elements by
 // attribute similarity, returning matched index pairs, unmatched after indices
 // (added), and unmatched before indices (removed).
-func matchBlockElements(resourceType string, path []string, before, after []map[string]interface{}) (matches [][2]int, added, removed []int, err error) {
+func matchBlockElements(idreg *blockid.Registry, resourceType string, path []string, before, after []map[string]interface{}) (matches [][2]int, added, removed []int, err error) {
 	if len(before) == 1 && len(after) == 1 && !hasDifferentNameIdentity(before[0], after[0]) {
 		return [][2]int{{0, 0}}, nil, nil, nil
 	}
-	identity := identityKeys(resourceType, path)
+	identity := idreg.Keys(resourceType, path)
 	used := make([]bool, len(after))
 	for bi, bm := range before {
 		bestScore, bestAi := -1, -1
@@ -920,28 +927,6 @@ func hasDifferentNameIdentity(a, b map[string]interface{}) bool {
 	av, aOK := a["name"]
 	bv, bOK := b["name"]
 	return aOK && bOK && !reflect.DeepEqual(av, bv)
-}
-
-func identityKeys(resourceType string, path []string) []string {
-	if resourceType == "azurerm_application_gateway" && len(path) > 0 {
-		switch path[len(path)-1] {
-		case "backend_address_pool",
-			"backend_http_settings",
-			"frontend_ip_configuration",
-			"frontend_port",
-			"gateway_ip_configuration",
-			"http_listener",
-			"probe",
-			"redirect_configuration",
-			"request_routing_rule",
-			"rewrite_rule_set",
-			"ssl_certificate",
-			"trusted_root_certificate",
-			"url_path_map":
-			return []string{"name"}
-		}
-	}
-	return nil
 }
 
 func canAddMissingNestedAttr(edit BlockAttrEdit) bool {
