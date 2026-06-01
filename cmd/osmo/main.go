@@ -54,6 +54,12 @@ func (r *repeatedFlag) Set(v string) error {
 }
 
 func main() {
+	// Subcommand dispatch (before flag.Parse so global flags don't shadow them).
+	if len(os.Args) > 1 && os.Args[1] == "triage" {
+		triageCmd(os.Args[2:])
+		return
+	}
+
 	dir := flag.String("dir", ".", "Terraform working directory")
 	bin := flag.String("terraform", "terraform", "Terraform binary to use")
 	write := flag.Bool("write", false, "Write absorbed changes to disk (default: diff only)")

@@ -45,10 +45,18 @@ type Defaults struct {
 	JSON      *bool    `json:"json"`
 }
 
+// TriageConfig holds per-project triage rule overrides from .osmo.json.
+type TriageConfig struct {
+	FlagResources []string `json:"flag_resources"` // additional resource types to always flag
+	FlagAttrs     []string `json:"flag_attrs"`      // additional attr name patterns → Flag
+	SafeAttrs     []string `json:"safe_attrs"`      // additional attr name patterns → Safe
+}
+
 // Config is the full contents of .osmo.json.
 type Config struct {
 	BlockIdentity map[string][]string `json:"block_identity"`
 	Defaults      Defaults            `json:"defaults"`
+	Triage        TriageConfig        `json:"triage"`
 }
 
 // Registry is an immutable lookup of identity keys per resource+block type.

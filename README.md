@@ -57,6 +57,63 @@ osmo -dir ./infra -write -verify
 | `-exclude` | `` | Skip drift on this resource address (repeatable / comma-separated; wins over `-target`) |
 | `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
 
+## Drift triage — know what's safe before absorbing
+
+```sh
+osmo triage -dir ./infra          # detect drift and classify it
+osmo -dir ./infra -json | osmo triage   # pipe from existing run
+osmo triage -plan-json plan.json  # use saved plan
+```
+
+Output:
+```
+osmo triage: 4 resource(s) analysed
+
+✅ SAFE (2) — absorb freely
+   aws_instance.web                              instance_type, tags
+   aws_s3_bucket.logs                            tags
+
+⚠️  REVIEW (1) — verify intent before absorbing
+   aws_autoscaling_group.api                     desired_capacity
+                                                 reason: capacity/autoscaler attribute — may be externally managed
+                                                 tip:    if autoscaler-managed, consider: lifecycle { ignore_changes = [desired_capacity] }
+
+🚩 SECURITY FLAG (1) — investigate before absorbing
+   aws_security_group.public                     ingress
+                                                 reason: aws_security_group: controls network ingress/egress
+                                                 tip:    investigate before absorbing — if intentional: osmo -write -target aws_security_group.public -approve
+
+Suggested command (safe resources only):
+  osmo -dir ./infra -write \
+    -target aws_instance.web \
+    -target aws_s3_bucket.logs \
+    -exclude aws_security_group.public
+```
+
+**No API key. No network calls. Fully offline.** Classification is deterministic rule-based:
+
+| Verdict | Rule |
+|---|---|
+| `safe` | tags, descriptions, scalar size/type attrs |
+| `review` | capacity/autoscaler attrs (`desired_capacity`, `replica_count`, …) — consider `lifecycle.ignore_changes` |
+| `flag` | security-sensitive resource types (IAM, security groups, KMS, public access blocks, …) or attributes (`cidr`, `policy`, `ingress`, `egress`, …) |
+
+Rules are extensible via `.osmo.json`:
+
+```json
+{
+  "triage": {
+    "flag_resources": ["my_custom_firewall", "vault_policy"],
+    "flag_attrs":     ["secret_arn", "trust_relationship"],
+    "safe_attrs":     ["cost_center"]
+  }
+}
+```
+
+Exit codes: `0` all safe · `2` any review/flag · `1` error.
+
+---
+
 ## OpenTofu support
 
 osmo is compatible with both Terraform and OpenTofu. Binary selection priority:

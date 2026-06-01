@@ -11,6 +11,30 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.3.0] - 2026-06-02
+
+### Added
+- **`osmo triage` subcommand**: classifies every drifted resource as SAFE /
+  REVIEW / FLAG before anything is absorbed. Fully offline — no API key, no
+  network calls, deterministic rule engine.
+  - SAFE: tags, descriptions, scalar size/type changes
+  - REVIEW: capacity/autoscaler attrs (`desired_capacity`, `replica_count`, …);
+    suggests `lifecycle.ignore_changes` as alternative
+  - FLAG: security-sensitive resource types (IAM, security groups, KMS, network
+    ACLs, S3 public-access blocks, Azure NSG, GCP firewall rules, …) and
+    security-sensitive attribute patterns (`cidr`, `policy`, `ingress`,
+    `egress`, `kms_key`, `principal`, …)
+  - Emits a ready-to-run `osmo … -write -target … -exclude …` command
+    scoped to only the safe resources
+  - `-json` flag for machine-readable output
+  - Three invocation modes: live detection, piped from `osmo -json`, or
+    pre-generated `-plan-json`
+- **`.osmo.json` triage config**: `"triage"` section extends the built-in rule
+  registry with per-project `flag_resources`, `flag_attrs`, `safe_attrs`.
+  Follows the same extensibility pattern as `block_identity`.
+
+---
+
 ## [1.2.0] - 2026-06-02
 
 ### Added
