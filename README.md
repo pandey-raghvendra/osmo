@@ -31,10 +31,62 @@ osmo -dir ./infra -write -verify
 | `-terraform` | `terraform` | Terraform binary path |
 | `-write` | `false` | Write changes to disk (else diff only) |
 | `-verify` | `false` | After writing, run a normal plan; roll back files if any absorbed resource still has a planned change (requires `-write`; not usable with `-plan-json`) |
-| `-approve` | `false` | Interactively approve each file change before writing (requires `-write`) |
+| `-approve` | `false` | Interactively approve each file change before writing (requires `-write` and a TTY) |
+| `-json` | `false` | Emit a single JSON object to stdout instead of human-readable output |
 | `-target` | `` | Only absorb drift on this resource address (repeatable / comma-separated) |
 | `-exclude` | `` | Skip drift on this resource address (repeatable / comma-separated; wins over `-target`) |
 | `-plan-json` | `` | Path to pre-generated `terraform show -json` output (skips detection) |
+
+## Exit codes
+
+osmo follows the Terraform `detailed-exitcode` convention:
+
+| Code | Meaning |
+|---|---|
+| `0` | No drift detected (or `-target`/`-exclude` matched nothing) |
+| `1` | Execution error |
+| `2` | Drift found — changes proposed, written, or unresolved drift reported |
+
+Use exit code `2` as the CI gate: if osmo exits 2, the diff needs review.
+
+## JSON output for CI / PR bots
+
+`-json` emits a single JSON object to stdout, all human text suppressed:
+
+```sh
+osmo -dir ./infra -json | jq .result
+osmo -dir ./infra -write -json > osmo.json
+```
+
+```json
+{
+  "osmo_version": "0.1.4",
+  "result": "proposed",
+  "drift_count": 2,
+  "changes": [
+    {
+      "path": "infra/main.tf",
+      "edits": [{ "address": "aws_instance.web", "attrs": ["instance_type"] }],
+      "diff": "--- a/infra/main.tf\n+++ b/infra/main.tf\n..."
+    }
+  ],
+  "unresolved": []
+}
+```
+
+`result` values: `no_drift` · `no_match` · `proposed` · `absorbed` · `nothing_absorbable` · `verify_failed` · `error`
+
+### GitHub Actions example
+
+```yaml
+- name: Absorb drift
+  id: osmo
+  run: osmo -dir ./infra -write -json > osmo.json; echo "exit=$?" >> $GITHUB_OUTPUT
+
+- name: Open PR if drift absorbed
+  if: steps.osmo.outputs.exit == '2'
+  run: gh pr create --title "chore: absorb Terraform drift" --body "$(jq -r '.changes[].diff' osmo.json)"
+```
 
 ---
 

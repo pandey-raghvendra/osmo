@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/pandey-raghvendra/osmo/internal/absorb"
@@ -82,6 +85,66 @@ func TestFilterDrifts(t *testing.T) {
 			t.Fatalf("input slice was mutated: %v", addrs(drifts))
 		}
 	})
+}
+
+func TestIsTerminal(t *testing.T) {
+	// A regular file is never a terminal.
+	f, err := os.CreateTemp(t.TempDir(), "notty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if isTerminal(f) {
+		t.Fatal("regular file should not be a terminal")
+	}
+}
+
+func TestRunJSONNoDrift(t *testing.T) {
+	// Write a minimal plan JSON with no resource_drift.
+	planJSON := `{"resource_drift":[],"configuration":{"root_module":{}}}`
+	tmp := t.TempDir()
+	pf := filepath.Join(tmp, "plan.json")
+	if err := os.WriteFile(pf, []byte(planJSON), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture stdout by redirecting it.
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+
+	code, runErr := run(t.Context(), runOpts{
+		dir:      tmp,
+		planFile: pf,
+		jsonOut:  true,
+	})
+
+	w.Close()
+	os.Stdout = old
+
+	buf := make([]byte, 4096)
+	n, _ := r.Read(buf)
+	r.Close()
+
+	if runErr != nil {
+		t.Fatal(runErr)
+	}
+	if code != exitOK {
+		t.Fatalf("want exit %d, got %d", exitOK, code)
+	}
+	var out JSONResult
+	if err := json.Unmarshal(buf[:n], &out); err != nil {
+		t.Fatalf("invalid JSON: %v\nraw: %s", err, buf[:n])
+	}
+	if out.Result != "no_drift" {
+		t.Fatalf("want result=no_drift, got %q", out.Result)
+	}
+	if out.OsmoVersion == "" {
+		t.Fatal("osmo_version missing from JSON output")
+	}
 }
 
 func TestAbsorbedAddresses(t *testing.T) {

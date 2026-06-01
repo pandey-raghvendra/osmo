@@ -1,12 +1,17 @@
 // Command osmo detects Terraform drift and proposes HCL changes that make
 // configuration follow real-world reality (the "absorb" direction).
 //
-// Prints a unified diff to stdout by default. Pass -write to apply to disk.
+// Exit codes:
+//
+//	0 — no drift detected (or selection matched nothing)
+//	1 — execution error
+//	2 — drift found: changes proposed/written and/or unresolved drift reported
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -24,6 +29,12 @@ var (
 	version = "dev"
 	commit  = "none"
 	date    = "unknown"
+)
+
+const (
+	exitOK      = 0 // no drift, nothing to do
+	exitError   = 1 // runtime or usage error
+	exitChanges = 2 // drift found: changes proposed/written or unresolved drift
 )
 
 // repeatedFlag collects a comma-separated or repeated string flag.
@@ -44,8 +55,9 @@ func main() {
 	bin := flag.String("terraform", "terraform", "Terraform binary to use")
 	write := flag.Bool("write", false, "Write absorbed changes to disk (default: diff only)")
 	planFile := flag.String("plan-json", "", "Path to pre-generated `terraform show -json` output (skips plan detection; use with Terraform Cloud or CI)")
-	verify := flag.Bool("verify", false, "After writing, re-run a refresh-only plan; if drift remains on absorbed resources, roll back the files (requires -write; incompatible with -plan-json)")
-	approve := flag.Bool("approve", false, "Interactively approve each file change before writing (requires -write)")
+	verify := flag.Bool("verify", false, "After writing, run terraform plan; roll back files if any absorbed resource still has planned changes (requires -write; incompatible with -plan-json)")
+	approve := flag.Bool("approve", false, "Interactively approve each file change before writing (requires -write; requires a TTY)")
+	jsonOut := flag.Bool("json", false, "Emit a single JSON object to stdout instead of human-readable output")
 	var targets repeatedFlag
 	var excludes repeatedFlag
 	flag.Var(&targets, "target", "Only absorb drift on this resource address (repeatable / comma-separated; matches modules and indexed instances by prefix)")
@@ -68,13 +80,19 @@ func main() {
 		write:    *write,
 		verify:   *verify,
 		approve:  *approve,
+		jsonOut:  *jsonOut,
 		targets:  targets,
 		excludes: excludes,
 	}
-	if err := run(ctx, opts); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	code, err := run(ctx, opts)
+	if err != nil {
+		if opts.jsonOut {
+			writeJSON(errorJSON(err))
+		} else {
+			fmt.Fprintln(os.Stderr, "error:", err)
+		}
 	}
+	os.Exit(code)
 }
 
 type runOpts struct {
@@ -84,44 +102,138 @@ type runOpts struct {
 	write    bool
 	verify   bool
 	approve  bool
+	jsonOut  bool
 	targets  []string
 	excludes []string
 }
 
-func run(ctx context.Context, o runOpts) error {
+// ---- JSON output types --------------------------------------------------
+
+// JSONResult is the machine-readable output emitted by -json.
+type JSONResult struct {
+	OsmoVersion string           `json:"osmo_version"`
+	Result      string           `json:"result"`
+	DriftCount  int              `json:"drift_count"`
+	Changes     []JSONChange     `json:"changes"`
+	Unresolved  []JSONUnresolved `json:"unresolved"`
+	Error       string           `json:"error,omitempty"`
+}
+
+// Result values:
+//
+//	"no_drift"           — no resource_drift in plan
+//	"no_match"           — drift found but -target/-exclude filtered all
+//	"proposed"           — dry-run: changes proposed, not written
+//	"absorbed"           — changes written to disk
+//	"nothing_absorbable" — drift found but nothing could be auto-absorbed
+//	"verify_failed"      — written but verify showed remaining changes; rolled back
+//	"error"              — execution error
+
+type JSONChange struct {
+	Path  string     `json:"path"`
+	Edits []JSONEdit `json:"edits"`
+	Diff  string     `json:"diff"`
+}
+
+type JSONEdit struct {
+	Address string   `json:"address"`
+	Attrs   []string `json:"attrs"`
+}
+
+type JSONUnresolved struct {
+	Address string `json:"address"`
+	Attr    string `json:"attr"`
+	Reason  string `json:"reason"`
+}
+
+func errorJSON(err error) JSONResult {
+	return JSONResult{
+		OsmoVersion: version,
+		Result:      "error",
+		Changes:     []JSONChange{},
+		Unresolved:  []JSONUnresolved{},
+		Error:       err.Error(),
+	}
+}
+
+func writeJSON(r JSONResult) {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(r)
+}
+
+// ---- run ---------------------------------------------------------------
+
+func run(ctx context.Context, o runOpts) (int, error) {
 	if o.verify {
 		if !o.write {
-			return fmt.Errorf("-verify requires -write (nothing is written to verify otherwise)")
+			return exitError, fmt.Errorf("-verify requires -write (nothing is written to verify otherwise)")
 		}
 		if o.planFile != "" {
-			return fmt.Errorf("-verify needs a live refresh-only plan and is incompatible with -plan-json")
+			return exitError, fmt.Errorf("-verify needs a live plan and is incompatible with -plan-json")
 		}
 	}
-	if o.approve && !o.write {
-		return fmt.Errorf("-approve requires -write")
+	if o.approve {
+		if !o.write {
+			return exitError, fmt.Errorf("-approve requires -write")
+		}
+		if !isTerminal(os.Stdin) {
+			return exitError, fmt.Errorf("-approve requires an interactive TTY; in CI use -target or -exclude instead")
+		}
 	}
 
+	if !o.jsonOut {
+		fmt.Fprintln(os.Stderr, "detecting drift (terraform plan -refresh-only)...")
+	}
 	drifts, raw, err := loadDrift(ctx, o)
 	if err != nil {
-		return err
+		return exitError, err
 	}
+
 	if len(drifts) == 0 {
-		fmt.Println("no drift detected.")
-		return nil
+		if o.jsonOut {
+			writeJSON(JSONResult{
+				OsmoVersion: version,
+				Result:      "no_drift",
+				DriftCount:  0,
+				Changes:     []JSONChange{},
+				Unresolved:  []JSONUnresolved{},
+			})
+		} else {
+			fmt.Println("no drift detected.")
+		}
+		return exitOK, nil
 	}
 
 	drifts = filterDrifts(drifts, o.targets, o.excludes)
 	if len(drifts) == 0 {
-		fmt.Println("no drift matched -target/-exclude selection.")
-		return nil
+		if o.jsonOut {
+			writeJSON(JSONResult{
+				OsmoVersion: version,
+				Result:      "no_match",
+				DriftCount:  0,
+				Changes:     []JSONChange{},
+				Unresolved:  []JSONUnresolved{},
+			})
+		} else {
+			fmt.Println("no drift matched -target/-exclude selection.")
+		}
+		return exitOK, nil
 	}
 
 	changes, unresolved, err := absorb.Plan(o.dir, drifts, raw)
 	if err != nil {
-		return err
+		return exitError, err
 	}
 
-	// Print every proposed change; in approve mode, collect the user's picks.
+	if o.jsonOut {
+		return runJSON(ctx, o, changes, unresolved, len(drifts))
+	}
+	return runHuman(ctx, o, changes, unresolved, len(drifts))
+}
+
+// runHuman handles the human-readable output path.
+func runHuman(ctx context.Context, o runOpts, changes []absorb.FileChange, unresolved []provenance.Unresolved, driftCount int) (int, error) {
 	var approved []absorb.FileChange
 	in := bufio.NewReader(os.Stdin)
 	for _, c := range changes {
@@ -144,28 +256,112 @@ func run(ctx context.Context, o runOpts) error {
 	printUnresolved(unresolved)
 
 	if !o.write {
-		reportDryRun(len(changes), len(unresolved), len(drifts))
-		return nil
+		reportDryRun(len(changes), len(unresolved), driftCount)
+		if len(changes) > 0 || len(unresolved) > 0 {
+			return exitChanges, nil
+		}
+		return exitOK, nil
 	}
 
 	written, err := writeChanges(approved)
 	if err != nil {
-		return err
+		return exitError, err
 	}
 	if len(written) == 0 {
 		fmt.Println("\nno changes written.")
-		return nil
+		if len(unresolved) > 0 {
+			return exitChanges, nil
+		}
+		return exitOK, nil
 	}
 	fmt.Printf("\nwrote %d file change(s).\n", len(written))
 
 	if o.verify {
-		return verifyAndMaybeRollback(ctx, o, written)
+		if err := verifyAndMaybeRollback(ctx, o, written); err != nil {
+			return exitError, err
+		}
+	} else {
+		fmt.Println("run `terraform plan` to verify drift resolved.")
 	}
-	fmt.Println("run `terraform plan` to verify drift resolved.")
-	return nil
+	return exitChanges, nil
 }
 
-// loadDrift returns drift either from a supplied plan JSON or a live plan.
+// runJSON handles the -json output path.
+func runJSON(ctx context.Context, o runOpts, changes []absorb.FileChange, unresolved []provenance.Unresolved, driftCount int) (int, error) {
+	jChanges := make([]JSONChange, 0, len(changes))
+	for _, c := range changes {
+		jc := JSONChange{
+			Path: c.Path,
+			Diff: diff.Unified(c.Path, c.Before, c.After),
+		}
+		for _, e := range c.Edits {
+			jc.Edits = append(jc.Edits, JSONEdit{Address: e.Address, Attrs: e.Attrs})
+		}
+		jChanges = append(jChanges, jc)
+	}
+	jUnresolved := make([]JSONUnresolved, 0, len(unresolved))
+	for _, u := range unresolved {
+		jUnresolved = append(jUnresolved, JSONUnresolved{Address: u.Address, Attr: u.Attr, Reason: u.Reason})
+	}
+
+	result := "nothing_absorbable"
+	switch {
+	case len(changes) > 0 && !o.write:
+		result = "proposed"
+	case len(changes) > 0 && o.write:
+		result = "absorbed"
+	}
+
+	if !o.write {
+		writeJSON(JSONResult{
+			OsmoVersion: version,
+			Result:      result,
+			DriftCount:  driftCount,
+			Changes:     jChanges,
+			Unresolved:  jUnresolved,
+		})
+		if len(changes) > 0 || len(unresolved) > 0 {
+			return exitChanges, nil
+		}
+		return exitOK, nil
+	}
+
+	// Write phase.
+	written, err := writeChanges(changes)
+	if err != nil {
+		return exitError, err
+	}
+
+	if o.verify && len(written) > 0 {
+		fmt.Fprintln(os.Stderr, "verifying (terraform plan)...")
+		if verifyErr := verifyAndMaybeRollback(ctx, o, written); verifyErr != nil {
+			writeJSON(JSONResult{
+				OsmoVersion: version,
+				Result:      "verify_failed",
+				DriftCount:  driftCount,
+				Changes:     jChanges,
+				Unresolved:  jUnresolved,
+				Error:       verifyErr.Error(),
+			})
+			return exitError, nil // error already in JSON; don't double-print
+		}
+	}
+
+	writeJSON(JSONResult{
+		OsmoVersion: version,
+		Result:      result,
+		DriftCount:  driftCount,
+		Changes:     jChanges,
+		Unresolved:  jUnresolved,
+	})
+	if len(changes) > 0 || len(unresolved) > 0 {
+		return exitChanges, nil
+	}
+	return exitOK, nil
+}
+
+// ---- helpers ------------------------------------------------------------
+
 func loadDrift(ctx context.Context, o runOpts) ([]tfplan.Drift, []byte, error) {
 	if o.planFile != "" {
 		raw, err := os.ReadFile(o.planFile)
@@ -176,15 +372,14 @@ func loadDrift(ctx context.Context, o runOpts) ([]tfplan.Drift, []byte, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		fmt.Fprintf(os.Stderr, "using plan json: %s (%d drift(s))\n", o.planFile, len(drifts))
+		if !o.jsonOut {
+			fmt.Fprintf(os.Stderr, "using plan json: %s (%d drift(s))\n", o.planFile, len(drifts))
+		}
 		return drifts, raw, nil
 	}
-	fmt.Fprintln(os.Stderr, "detecting drift (terraform plan -refresh-only)...")
 	return tfplan.Detect(ctx, o.dir, o.bin)
 }
 
-// writeChanges writes each FileChange to disk, returning the ones written so
-// they can be rolled back later.
 func writeChanges(changes []absorb.FileChange) ([]absorb.FileChange, error) {
 	var written []absorb.FileChange
 	for _, c := range changes {
@@ -196,12 +391,10 @@ func writeChanges(changes []absorb.FileChange) ([]absorb.FileChange, error) {
 	return written, nil
 }
 
-// verifyAndMaybeRollback runs a normal (config-driven) plan after writing. The
-// absorb edits config to match reality, so a converged resource shows no
-// planned action. If any absorbed resource is still actionable, all written
-// files are restored to their pre-absorb content and a non-nil error returned.
 func verifyAndMaybeRollback(ctx context.Context, o runOpts, written []absorb.FileChange) error {
-	fmt.Fprintln(os.Stderr, "verifying (terraform plan)...")
+	if !o.jsonOut {
+		fmt.Fprintln(os.Stderr, "verifying (terraform plan)...")
+	}
 	actionable, err := tfplan.PlannedChanges(ctx, o.dir, o.bin)
 	if err != nil {
 		if rbErr := rollback(written); rbErr != nil {
@@ -211,25 +404,26 @@ func verifyAndMaybeRollback(ctx context.Context, o runOpts, written []absorb.Fil
 	}
 
 	absorbed := absorbedAddresses(written)
-	var stillDrifting []string
+	var stillChanging []string
 	for _, addr := range actionable {
 		if absorbed[addr] {
-			stillDrifting = append(stillDrifting, addr)
+			stillChanging = append(stillChanging, addr)
 		}
 	}
 
-	if len(stillDrifting) == 0 {
-		fmt.Printf("verified: %d absorbed resource(s) show no planned changes.\n", len(absorbed))
+	if len(stillChanging) == 0 {
+		if !o.jsonOut {
+			fmt.Printf("verified: %d absorbed resource(s) show no planned changes.\n", len(absorbed))
+		}
 		return nil
 	}
 
 	if rbErr := rollback(written); rbErr != nil {
-		return fmt.Errorf("verification failed (changes remain on %v) and rollback failed: %w", stillDrifting, rbErr)
+		return fmt.Errorf("verification failed (changes remain on %v) and rollback failed: %w", stillChanging, rbErr)
 	}
-	return fmt.Errorf("verification failed: planned changes remain on %v after absorb; rolled back %d file(s)", stillDrifting, len(written))
+	return fmt.Errorf("verification failed: planned changes remain on %v after absorb; rolled back %d file(s)", stillChanging, len(written))
 }
 
-// rollback restores each written file to its pre-absorb content.
 func rollback(written []absorb.FileChange) error {
 	for _, c := range written {
 		if err := os.WriteFile(c.Path, c.Before, 0o644); err != nil {
@@ -249,8 +443,6 @@ func absorbedAddresses(changes []absorb.FileChange) map[string]bool {
 	return addrs
 }
 
-// filterDrifts keeps only drifts matching the target selection (all if empty)
-// and drops any matching the exclude selection (exclude wins).
 func filterDrifts(drifts []tfplan.Drift, targets, excludes []string) []tfplan.Drift {
 	if len(targets) == 0 && len(excludes) == 0 {
 		return drifts
@@ -268,8 +460,6 @@ func filterDrifts(drifts []tfplan.Drift, targets, excludes []string) []tfplan.Dr
 	return out
 }
 
-// matchesAny reports whether addr equals or is nested under any selector.
-// "module.x" matches "module.x.aws_instance.y"; "aws_x.y" matches "aws_x.y[0]".
 func matchesAny(addr string, selectors []string) bool {
 	for _, s := range selectors {
 		if addr == s || strings.HasPrefix(addr, s+".") || strings.HasPrefix(addr, s+"[") {
@@ -312,4 +502,9 @@ func reportDryRun(changeCount, unresolvedCount, driftCount int) {
 	default:
 		fmt.Printf("\n%d file change(s) proposed. re-run with -write to apply, then `terraform plan` to verify.\n", changeCount)
 	}
+}
+
+func isTerminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
 }
