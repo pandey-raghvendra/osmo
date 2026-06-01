@@ -1,18 +1,27 @@
 // Package blockid provides the identity-key registry used to match set-typed
-// nested blocks by a stable attribute (e.g. "name") rather than by position.
+// nested blocks by a stable attribute (e.g. "name") rather than by position,
+// and loads the optional per-project .osmo.json configuration file.
 //
-// Built-in entries cover common providers. Projects can extend or override via
-// .osmo.json in the Terraform working directory:
+// Full .osmo.json schema:
 //
 //	{
 //	  "block_identity": {
 //	    "google_compute_firewall.allow": ["protocol"],
-//	    "my_custom_resource.my_block": ["id"]
+//	    "my_custom_resource.my_block":  ["id"]
+//	  },
+//	  "defaults": {
+//	    "dir":       "./infra",
+//	    "terraform": "/usr/local/bin/terraform",
+//	    "targets":   ["module.app"],
+//	    "excludes":  ["aws_instance.bastion"],
+//	    "write":     false,
+//	    "verify":    false,
+//	    "json":      false
 //	  }
 //	}
 //
-// The map key is "<resource_type>.<block_type>" (last element of the nesting
-// path). User entries take precedence over built-ins.
+// block_identity keys are "<resource_type>.<block_type>". User entries override
+// built-ins. defaults are applied only for CLI flags the user did not set.
 package blockid
 
 import (
@@ -24,14 +33,30 @@ import (
 // ConfigFile is the name of the optional per-project config file.
 const ConfigFile = ".osmo.json"
 
-// osmoJSON is the schema of the optional project config file.
-type osmoJSON struct {
+// Defaults holds per-project CLI flag defaults. A nil pointer field means
+// "not set in config" and will not override the compiled-in flag default.
+type Defaults struct {
+	Dir       string   `json:"dir"`
+	Terraform string   `json:"terraform"`
+	Targets   []string `json:"targets"`
+	Excludes  []string `json:"excludes"`
+	Write     *bool    `json:"write"`
+	Verify    *bool    `json:"verify"`
+	JSON      *bool    `json:"json"`
+}
+
+// Config is the full contents of .osmo.json.
+type Config struct {
 	BlockIdentity map[string][]string `json:"block_identity"`
+	Defaults      Defaults            `json:"defaults"`
+}
+
+// Registry is an immutable lookup of identity keys per resource+block type.
+type Registry struct {
+	m map[string][]string
 }
 
 // builtins maps "resource_type.block_type" → identity key names.
-// These cover set-typed blocks in commonly used providers where positional
-// matching produces false diffs.
 var builtins = map[string][]string{
 	// Azure Application Gateway — all named sub-resources are sets keyed by name.
 	"azurerm_application_gateway.backend_address_pool":      {"name"},
@@ -48,7 +73,7 @@ var builtins = map[string][]string{
 	"azurerm_application_gateway.trusted_root_certificate":  {"name"},
 	"azurerm_application_gateway.url_path_map":              {"name"},
 
-	// Azure Load Balancer — pools, rules, probes are named sets.
+	// Azure Load Balancer.
 	"azurerm_lb.frontend_ip_configuration": {"name"},
 
 	// GCP Compute — firewall allow/deny keyed by protocol.
@@ -62,37 +87,43 @@ var builtins = map[string][]string{
 	"google_container_cluster.node_pool": {"name"},
 }
 
-// Registry is an immutable lookup of identity keys per resource+block type.
-type Registry struct {
-	m map[string][]string
-}
-
-// Load reads .osmo.json from dir (if present) and merges it with the built-in
-// defaults. User entries override built-ins for the same key.
-// An absent config file is not an error.
-func Load(dir string) (*Registry, error) {
-	merged := make(map[string][]string, len(builtins))
-	for k, v := range builtins {
-		merged[k] = v
-	}
-
+// LoadConfig reads .osmo.json from dir and returns the full Config.
+// An absent config file returns a zero Config (not an error).
+func LoadConfig(dir string) (*Config, error) {
 	path := filepath.Join(dir, ConfigFile)
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return &Registry{m: merged}, nil
+		return &Config{}, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-
-	var cfg osmoJSON
+	var cfg Config
 	if err := json.Unmarshal(raw, &cfg); err != nil {
 		return nil, err
 	}
-	for k, v := range cfg.BlockIdentity {
+	return &cfg, nil
+}
+
+// Load reads .osmo.json from dir and returns the identity-key Registry.
+// An absent config file returns a Registry with built-in defaults only.
+func Load(dir string) (*Registry, error) {
+	cfg, err := LoadConfig(dir)
+	if err != nil {
+		return nil, err
+	}
+	return cfg.registry(), nil
+}
+
+func (c *Config) registry() *Registry {
+	merged := make(map[string][]string, len(builtins))
+	for k, v := range builtins {
 		merged[k] = v
 	}
-	return &Registry{m: merged}, nil
+	for k, v := range c.BlockIdentity {
+		merged[k] = v
+	}
+	return &Registry{m: merged}
 }
 
 // Keys returns the identity key names for the given resource type and nesting

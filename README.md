@@ -136,13 +136,21 @@ matches `aws_instance.web[0]`. `-exclude` always wins over `-target`.
 
 ## Project config: `.osmo.json`
 
-Place `.osmo.json` in the Terraform working directory to extend or override
-built-in block identity keys. Identity keys tell osmo how to match set-typed
-nested blocks by a stable attribute rather than by position, preventing false
-diffs when provider semantics change element ordering.
+Place `.osmo.json` in the Terraform working directory to set per-project
+defaults (so you don't repeat flags every run) and to extend or override
+built-in block identity keys.
 
 ```json
 {
+  "defaults": {
+    "dir":       "./infra",
+    "terraform": "/usr/local/bin/terraform",
+    "targets":   ["module.app"],
+    "excludes":  ["aws_instance.bastion"],
+    "write":     false,
+    "verify":    false,
+    "json":      false
+  },
   "block_identity": {
     "google_compute_firewall.allow": ["protocol"],
     "azurerm_lb.backend_address_pool": ["name"],
@@ -151,7 +159,8 @@ diffs when provider semantics change element ordering.
 }
 ```
 
-Map key format: `"<resource_type>.<block_type>"`. User entries override built-ins.
+CLI flags always win over `defaults`. Unset flags inherit from `defaults`.
+`block_identity` map key format: `"<resource_type>.<block_type>"`. User entries override built-ins.
 
 **Built-in registry** (no config needed):
 
@@ -354,11 +363,45 @@ go build -o osmo ./cmd/osmo
 
 | Gap | Notes |
 |---|---|
-| `local.*` provenance | locals absent from plan JSON — fundamental limit |
-| Composed expressions | `"${var.a}-${var.b}"` has multiple references |
+| `local.*` provenance | locals absent from plan JSON — fundamental Terraform limit, cannot be fixed |
+| Composed expressions | `"${var.a}-${var.b}"` has multiple references — reported as unresolved |
 | `dynamic` + map `for_each` | map reconstruction from expanded blocks not supported |
-| Out-of-band *created* resources | needs `import {}` + HCL codegen — out of scope |
-| Post-absorb verification | run `terraform plan` yourself to confirm 0 diff |
+| Out-of-band *created* resources | resources that exist in Azure/AWS but not in config are invisible to `resource_drift` — use `terraform import` then osmo |
+| Module arg / var default deletion | when a removed attr traces through a module arg or variable default, osmo reports it unresolved; only resource-block literals are auto-removed |
+| Terraform Cloud remote execution | `-verify` requires local plan execution; not supported on TFC remote runs |
+| Windows line endings | `hclwrite` outputs LF; files with CRLF line endings may show larger diffs |
+
+---
+
+## Troubleshooting
+
+**`terraform plan -refresh-only` fails inside osmo**
+
+osmo runs plan in a subprocess; all the usual causes apply — missing credentials, wrong workspace, version mismatch. Run `terraform plan -refresh-only` yourself first to isolate the issue.
+
+**`resource not found in configuration`**
+
+The resource is in state but osmo can't find its `configuration` block in the plan JSON. Common cause: the resource is inside a module sourced from a registry/Git URL rather than a local path — osmo cannot edit remote sources.
+
+**`traces to root var.X which has no literal default`**
+
+The drifted attribute traces to a variable with no `default` value (it's required input). Edit the module call's argument or the variable default manually.
+
+**`ambiguous nested block match`**
+
+Two or more blocks inside the resource have the same score — osmo can't identify which one changed without risking a wrong edit. Add a `block_identity` entry to `.osmo.json` to tell osmo which attribute uniquely identifies blocks of that type.
+
+**`-verify` rolls everything back unexpectedly**
+
+`-verify` runs a full `terraform plan` after writing and checks whether the absorbed resources still have planned changes. If your config has unrelated pending changes (i.e. things terraform would change anyway), those planned changes will trigger rollback. Use `-target` to scope both osmo and verify to the drifted resource only.
+
+**`-approve requires an interactive TTY`**
+
+You ran osmo with `-approve` in CI or a non-interactive shell. Use `-target`/`-exclude` for CI-safe scoping instead.
+
+**Diff looks right but `terraform plan` still shows changes**
+
+Most likely the drifted attribute was traced to a variable/module arg that controls multiple resources — osmo updates the literal, which may trigger changes on siblings. Review the diff carefully and use `-target` to absorb one resource at a time.
 
 ---
 

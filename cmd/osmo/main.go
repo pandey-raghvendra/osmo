@@ -19,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/pandey-raghvendra/osmo/internal/absorb"
+	"github.com/pandey-raghvendra/osmo/internal/blockid"
 	"github.com/pandey-raghvendra/osmo/internal/diff"
 	"github.com/pandey-raghvendra/osmo/internal/provenance"
 	"github.com/pandey-raghvendra/osmo/internal/tfplan"
@@ -68,6 +69,16 @@ func main() {
 	if *ver {
 		fmt.Printf("osmo %s (%s, %s)\n", version, commit[:min(7, len(commit))], date)
 		return
+	}
+
+	// Load .osmo.json from the working dir (which may still be "." at this
+	// point) and apply config defaults for flags the user did not set.
+	if cfg, err := blockid.LoadConfig(*dir); err != nil {
+		fmt.Fprintln(os.Stderr, "warning: could not load .osmo.json:", err)
+	} else {
+		set := map[string]bool{}
+		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
+		applyConfigDefaults(cfg, set, dir, bin, write, verify, jsonOut, &targets, &excludes)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -496,11 +507,43 @@ func printUnresolved(unresolved []provenance.Unresolved) {
 func reportDryRun(changeCount, unresolvedCount, driftCount int) {
 	switch {
 	case changeCount == 0 && unresolvedCount == 0:
-		fmt.Printf("%d resource(s) drifted, but no absorbable config attributes changed.\n", driftCount)
+		fmt.Printf("[dry run] %d resource(s) drifted — no absorbable config attributes found.\n", driftCount)
 	case changeCount == 0:
-		fmt.Println("\nno changes proposed; see unresolved drift above.")
+		fmt.Println("\n[dry run] no changes proposed; see unresolved drift above.")
 	default:
-		fmt.Printf("\n%d file change(s) proposed. re-run with -write to apply, then `terraform plan` to verify.\n", changeCount)
+		fmt.Printf("\n[dry run] %d file change(s) proposed above — re-run with -write to apply.\n", changeCount)
+	}
+}
+
+// applyConfigDefaults fills in values from cfg for flags the user did not set.
+func applyConfigDefaults(
+	cfg *blockid.Config,
+	set map[string]bool,
+	dir, bin *string,
+	write, verify, jsonOut *bool,
+	targets, excludes *repeatedFlag,
+) {
+	d := cfg.Defaults
+	if !set["dir"] && d.Dir != "" {
+		*dir = d.Dir
+	}
+	if !set["terraform"] && d.Terraform != "" {
+		*bin = d.Terraform
+	}
+	if !set["target"] && len(d.Targets) > 0 {
+		*targets = d.Targets
+	}
+	if !set["exclude"] && len(d.Excludes) > 0 {
+		*excludes = d.Excludes
+	}
+	if !set["write"] && d.Write != nil {
+		*write = *d.Write
+	}
+	if !set["verify"] && d.Verify != nil {
+		*verify = *d.Verify
+	}
+	if !set["json"] && d.JSON != nil {
+		*jsonOut = *d.JSON
 	}
 }
 

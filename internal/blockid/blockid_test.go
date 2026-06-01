@@ -87,3 +87,58 @@ func TestMalformedConfigFile(t *testing.T) {
 		t.Fatal("malformed JSON should return an error")
 	}
 }
+
+func TestLoadConfigDefaults(t *testing.T) {
+	dir := t.TempDir()
+	trueVal := true
+	_ = trueVal
+	cfg := `{
+		"defaults": {
+			"dir": "./infra",
+			"terraform": "/usr/bin/terraform",
+			"targets": ["module.app", "aws_instance.web"],
+			"excludes": ["aws_instance.bastion"],
+			"write": true,
+			"verify": true,
+			"json": false
+		}
+	}`
+	if err := os.WriteFile(filepath.Join(dir, ConfigFile), []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Defaults.Dir != "./infra" {
+		t.Errorf("dir: got %q", c.Defaults.Dir)
+	}
+	if c.Defaults.Terraform != "/usr/bin/terraform" {
+		t.Errorf("terraform: got %q", c.Defaults.Terraform)
+	}
+	if len(c.Defaults.Targets) != 2 || c.Defaults.Targets[0] != "module.app" {
+		t.Errorf("targets: got %v", c.Defaults.Targets)
+	}
+	if len(c.Defaults.Excludes) != 1 || c.Defaults.Excludes[0] != "aws_instance.bastion" {
+		t.Errorf("excludes: got %v", c.Defaults.Excludes)
+	}
+	if c.Defaults.Write == nil || !*c.Defaults.Write {
+		t.Errorf("write: got %v", c.Defaults.Write)
+	}
+	if c.Defaults.Verify == nil || !*c.Defaults.Verify {
+		t.Errorf("verify: got %v", c.Defaults.Verify)
+	}
+	if c.Defaults.JSON == nil || *c.Defaults.JSON {
+		t.Errorf("json: got %v", c.Defaults.JSON)
+	}
+}
+
+func TestLoadConfigMissingFile(t *testing.T) {
+	c, err := LoadConfig(t.TempDir())
+	if err != nil {
+		t.Fatal("missing file should not error:", err)
+	}
+	if c.Defaults.Dir != "" || len(c.Defaults.Targets) != 0 {
+		t.Errorf("empty config should have zero defaults, got %+v", c.Defaults)
+	}
+}
