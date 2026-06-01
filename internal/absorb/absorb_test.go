@@ -1302,6 +1302,119 @@ resource "aws_security_group" "sg" {
 	}
 }
 
+func TestForEachMapEntrySingleInstanceDrift(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  for_each = {
+    a = { instance_type = "t3.micro" }
+    b = { instance_type = "t3.small" }
+  }
+  instance_type = each.value.instance_type
+}
+`)
+	// Configuration tree: instance_type references each.value.instance_type.
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"references":["each.value.instance_type","each.value","each"]}}}]
+	}}}`
+	drifts := []tfplan.Drift{{
+		Address: `aws_instance.web["a"]`, Type: "aws_instance", Name: "web",
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d: %v", len(changes), changes)
+	}
+	got := string(changes[0].After)
+	// Instance "a" must be updated.
+	if !strings.Contains(got, `"t3.large"`) {
+		t.Errorf("instance a not updated:\n%s", got)
+	}
+	// Instance "b" must be untouched.
+	if !strings.Contains(got, `"t3.small"`) {
+		t.Errorf("instance b value lost:\n%s", got)
+	}
+	// Instance "a"'s old value must be gone.
+	if strings.Contains(got, `"t3.micro"`) {
+		t.Errorf("old value t3.micro still present after patch:\n%s", got)
+	}
+}
+
+func TestForEachMapEntryOtherInstanceUntouched(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  for_each = {
+    prod = { instance_type = "t3.large" }
+    dev  = { instance_type = "t3.micro" }
+  }
+  instance_type = each.value.instance_type
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"references":["each.value.instance_type","each.value","each"]}}}]
+	}}}`
+	// Only "prod" drifted — "dev" untouched.
+	drifts := []tfplan.Drift{{
+		Address: `aws_instance.web["prod"]`, Type: "aws_instance", Name: "web",
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.xlarge"}),
+	}}
+
+	changes, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) != 0 {
+		t.Fatalf("unexpected unresolved: %v", unresolved)
+	}
+	if len(changes) != 1 {
+		t.Fatalf("want 1 change, got %d", len(changes))
+	}
+	got := string(changes[0].After)
+	if !strings.Contains(got, `"t3.xlarge"`) {
+		t.Errorf("prod not updated:\n%s", got)
+	}
+	if !strings.Contains(got, `"t3.micro"`) {
+		t.Errorf("dev instance_type lost:\n%s", got)
+	}
+}
+
+func TestForEachMapEntryMissingKeyReportsUnresolved(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "main.tf", `resource "aws_instance" "web" {
+  for_each      = { a = { instance_type = "t3.micro" } }
+  instance_type = each.value.instance_type
+}
+`)
+	cfg := `{"configuration":{"root_module":{
+		"resources":[{"address":"aws_instance.web","mode":"managed","type":"aws_instance","name":"web",
+			"expressions":{"instance_type":{"references":["each.value.instance_type","each.value","each"]}}}]
+	}}}`
+	// Drift for key "z" which is not in the for_each map.
+	drifts := []tfplan.Drift{{
+		Address: `aws_instance.web["z"]`, Type: "aws_instance", Name: "web",
+		Before: tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.micro"}),
+		After:  tfplan.TFStateFrom(map[string]interface{}{"instance_type": "t3.large"}),
+	}}
+
+	_, unresolved, err := Plan(dir, drifts, []byte(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unresolved) == 0 {
+		t.Fatal("expected unresolved for missing key, got none")
+	}
+}
+
 func TestCRLFPreserved(t *testing.T) {
 	dir := t.TempDir()
 	// Write a .tf file with Windows CRLF line endings.

@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/hashicorp/hcl/v2"
@@ -136,6 +137,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 	var unresolved []provenance.Unresolved
 
 	type scalarOp struct {
+		addr      address.Addr
 		target    *provenance.Target
 		driftAddr string
 		attr      string
@@ -207,7 +209,7 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 				unresolved = append(unresolved, *u)
 				continue
 			}
-			scalarOps = append(scalarOps, scalarOp{t, d.Address, k})
+			scalarOps = append(scalarOps, scalarOp{addr, t, d.Address, k})
 		}
 		// Attrs present in before but absent from after: also removed from reality.
 		for k, bv := range d.Before {
@@ -273,6 +275,30 @@ func Plan(baseDir string, drifts []tfplan.Drift, raw []byte) ([]FileChange, []pr
 
 	// Scalar ops: provenance may redirect to a different (parent) module dir.
 	for _, o := range scalarOps {
+		// for_each map entry patching is handled locally (always in the resource's
+		// own module dir); no provenance redirect is needed.
+		if o.target.Kind == provenance.ForEachMapEntry {
+			dir, err := resolveDir(root, baseDir, o.addr.Modules)
+			if err != nil {
+				unresolved = append(unresolved, provenance.Unresolved{
+					Address: o.driftAddr, Attr: o.attr, Reason: err.Error()})
+				continue
+			}
+			de, err := getEditor(dir)
+			if err != nil {
+				return nil, nil, err
+			}
+			path, u := de.applyForEachMapPatch(o.addr, *o.target.InstanceKey, o.target.Attr, tfplan.FromGoValue(o.target.Value))
+			if u != nil {
+				unresolved = append(unresolved, *u)
+				continue
+			}
+			if path != "" {
+				record(path, o.driftAddr, o.attr)
+			}
+			continue
+		}
+
 		dir, err := resolveDir(root, baseDir, o.target.SourceModulePath)
 		if err != nil {
 			unresolved = append(unresolved, provenance.Unresolved{
@@ -626,6 +652,172 @@ func (de *dirEditor) applyScalarRemove(addr address.Addr, attr string) (string, 
 		return path, nil
 	}
 	return "", nil
+}
+
+// applyForEachMapPatch patches a single attribute inside the for_each map
+// literal for the given instanceKey. The for_each expression must be a fully
+// literal object; any non-literal value in the map causes the patch to report
+// Unresolved so callers can surface it cleanly.
+//
+//	resource "aws_instance" "web" {
+//	  for_each = { a = { instance_type = "t3.micro" } }
+//	  instance_type = each.value.instance_type
+//	}
+//
+// For drift on aws_instance.web["a"], instanceKey="a", mapAttr="instance_type".
+func (de *dirEditor) applyForEachMapPatch(addr address.Addr, instanceKey, mapAttr string, value tfplan.TFValue) (string, *provenance.Unresolved) { //nolint:unparam
+	outerType := "resource"
+	if addr.Mode == "data" {
+		outerType = "data"
+	}
+	driftAddr := addr.Type + "." + addr.Name + `["` + instanceKey + `"]`
+
+	unres := func(reason string) (string, *provenance.Unresolved) {
+		return "", &provenance.Unresolved{Address: driftAddr, Attr: mapAttr, Reason: reason}
+	}
+
+	for path, ff := range de.files {
+		resBlock := ff.f.Body().FirstMatchingBlock(outerType, []string{addr.Type, addr.Name})
+		if resBlock == nil {
+			continue
+		}
+		feAttr := resBlock.Body().GetAttribute("for_each")
+		if feAttr == nil {
+			return unres("resource has no for_each attribute")
+		}
+
+		// Extract current expression bytes from the hclwrite token stream.
+		exprBytes := feAttr.Expr().BuildTokens(nil).Bytes()
+
+		expr, diags := hclsyntax.ParseExpression(exprBytes, "<for_each>", hcl.Pos{Line: 1, Column: 1})
+		if diags.HasErrors() {
+			return unres("cannot parse for_each expression: " + diags.Error())
+		}
+		obj, ok := expr.(*hclsyntax.ObjectConsExpr)
+		if !ok {
+			return unres("for_each is not a literal object expression — cannot patch automatically")
+		}
+
+		for _, item := range obj.Items {
+			key, ok := hclObjectKey(item.KeyExpr)
+			if !ok || key != instanceKey {
+				continue
+			}
+			innerObj, ok := item.ValueExpr.(*hclsyntax.ObjectConsExpr)
+			if !ok {
+				return unres(fmt.Sprintf("for_each value for key %q is not an object literal", instanceKey))
+			}
+			for _, inner := range innerObj.Items {
+				attr, ok := hclObjectKey(inner.KeyExpr)
+				if !ok || attr != mapAttr {
+					continue
+				}
+				// Only patch literal values — reject references.
+				if !isHCLLiteral(inner.ValueExpr) {
+					return unres(fmt.Sprintf(
+						"for_each[%q].%s is not a literal value; cannot patch automatically", instanceKey, mapAttr))
+				}
+				newValBytes, err := renderTFValue(value)
+				if err != nil {
+					return unres(err.Error())
+				}
+				// Byte-surgery: replace the full value span within exprBytes.
+				vr := inner.ValueExpr.Range()
+				start, end := vr.Start.Byte, vr.End.Byte
+				newExpr := make([]byte, 0, len(exprBytes)+len(newValBytes))
+				newExpr = append(newExpr, exprBytes[:start]...)
+				newExpr = append(newExpr, newValBytes...)
+				newExpr = append(newExpr, exprBytes[end:]...)
+
+				// Rebuild the for_each attribute via a temp hclwrite parse.
+				tmpSrc := append([]byte("x = "), append(bytes.TrimRight(newExpr, "\n"), '\n')...)
+				tmpFile, tmpDiags := hclwrite.ParseConfig(tmpSrc, "<tmp>", hcl.Pos{Line: 1, Column: 1})
+				if tmpDiags.HasErrors() {
+					return unres("rebuild for_each after patch: " + tmpDiags.Error())
+				}
+				newTokens := tmpFile.Body().GetAttribute("x").Expr().BuildTokens(nil)
+				resBlock.Body().SetAttributeRaw("for_each", newTokens)
+				ff.dirty = true
+				return path, nil
+			}
+			return unres(fmt.Sprintf("attribute %q not found in for_each[%q]", mapAttr, instanceKey))
+		}
+		return unres(fmt.Sprintf("key %q not found in for_each map literal", instanceKey))
+	}
+	return "", nil // resource not in this directory's files
+}
+
+// hclObjectKey extracts a string key from an HCL object expression item key.
+// Handles bare identifiers (a = ...) and quoted string literals ("a" = ...).
+// Object keys are always wrapped in ObjectConsKeyExpr; we unwrap first.
+func hclObjectKey(expr hclsyntax.Expression) (string, bool) {
+	// Unwrap the outer ObjectConsKeyExpr that the parser always adds.
+	if wk, ok := expr.(*hclsyntax.ObjectConsKeyExpr); ok {
+		expr = wk.Wrapped
+	}
+	switch e := expr.(type) {
+	case *hclsyntax.LiteralValueExpr:
+		if e.Val.Type() == cty.String {
+			return e.Val.AsString(), true
+		}
+	case *hclsyntax.TemplateWrapExpr:
+		if lit, ok := e.Wrapped.(*hclsyntax.LiteralValueExpr); ok && lit.Val.Type() == cty.String {
+			return lit.Val.AsString(), true
+		}
+	case *hclsyntax.ScopeTraversalExpr:
+		// Bare identifier key: `a = ...`
+		if len(e.Traversal) == 1 {
+			if root, ok := e.Traversal[0].(hcl.TraverseRoot); ok {
+				return root.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
+// isHCLLiteral reports whether expr contains no variable references and can
+// therefore be safely replaced with a new literal value.
+func isHCLLiteral(expr hclsyntax.Expression) bool {
+	return len(expr.Variables()) == 0
+}
+
+// renderTFValue serialises a scalar TFValue to its HCL token representation.
+func renderTFValue(v tfplan.TFValue) ([]byte, error) {
+	if s, ok := v.AsString(); ok {
+		return []byte(`"` + hclEscapeString(s) + `"`), nil
+	}
+	if n, ok := v.AsNumber(); ok {
+		return []byte(strconv.FormatFloat(n, 'f', -1, 64)), nil
+	}
+	if b, ok := v.AsBool(); ok {
+		if b {
+			return []byte("true"), nil
+		}
+		return []byte("false"), nil
+	}
+	return nil, fmt.Errorf("cannot render non-scalar TFValue as HCL literal")
+}
+
+// hclEscapeString escapes characters that are special inside HCL string literals.
+func hclEscapeString(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func blockSelector(t *provenance.Target) (blockType string, labels []string, attr string) {

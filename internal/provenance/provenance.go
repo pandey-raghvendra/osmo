@@ -22,6 +22,7 @@ const (
 	ResourceAttr    Kind = iota // attribute literal inside a resource/data block
 	ModuleArg                   // argument literal on a `module "x" {}` call
 	VariableDefault             // `default` on a `variable "x" {}` declaration
+	ForEachMapEntry             // value inside the resource's for_each map literal
 )
 
 // Target is a concrete, editable location for absorbing one attribute's drift.
@@ -95,6 +96,24 @@ func Trace(root *config.Module, addr address.Addr, attr string, value interface{
 			Attr:             attr,
 			Value:            value,
 		}, nil
+	}
+
+	// each.value.X: single-instance for_each map entry patching.
+	// Safe only when: (a) the resource has a string instance key, and
+	// (b) all references collapse to a single each.value traversal.
+	if instanced && !isCountKey(instKey) {
+		if mapAttr := eachValueMapAttr(expr.References); mapAttr != "" {
+			k := instKey
+			return &Target{
+				Kind:         ForEachMapEntry,
+				ResourceMode: addr.Mode,
+				ResourceType: addr.Type,
+				ResourceName: addr.Name,
+				Attr:         mapAttr, // attribute within the for_each map entry value
+				Value:        value,
+				InstanceKey:  &k,
+			}, nil
+		}
 	}
 
 	ref, uerr := singleVarRef(expr.References)
@@ -316,4 +335,38 @@ func quoteKey(k string) string {
 		}
 	}
 	return k
+}
+
+// isCountKey reports whether k is a bare numeric count index rather than a
+// for_each string key. After splitIndex strips quotes, a string for_each key
+// can look like "0", so we rely on the original quoting convention: count
+// indices are never quoted in the address, for_each string keys always are.
+// splitIndex already unquotes both, so we use a simple digit check as proxy
+// (count indices are always non-negative integers).
+func isCountKey(k string) bool {
+	if k == "" {
+		return false
+	}
+	for _, c := range k {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// eachValueMapAttr scans a reference list for "each.value.<attr>" and returns
+// the <attr> part. Returns "" if the references don't follow this pattern.
+func eachValueMapAttr(refs []string) string {
+	const prefix = "each.value."
+	for _, r := range refs {
+		if strings.HasPrefix(r, prefix) {
+			name := r[len(prefix):]
+			// Must be a simple identifier (no further dots).
+			if name != "" && !strings.Contains(name, ".") {
+				return name
+			}
+		}
+	}
+	return ""
 }
