@@ -11,7 +11,7 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [1.5.0] - 2026-06-11
+## [1.5.1] - 2026-06-11
 
 ### Fixed
 - **`absorb`: dynamic-block removal drift silently dropped** — `ResName` was
