@@ -227,6 +227,9 @@ func run(ctx context.Context, o runOpts) (int, error) {
 		if !o.write {
 			return exitError, fmt.Errorf("-approve requires -write")
 		}
+		if o.jsonOut {
+			return exitError, fmt.Errorf("-approve is interactive and cannot be combined with -json")
+		}
 		if !isTerminal(os.Stdin) {
 			return exitError, fmt.Errorf("-approve requires an interactive TTY; in CI use -target or -exclude instead")
 		}

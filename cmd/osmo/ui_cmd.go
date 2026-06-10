@@ -1,19 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/pandey-raghvendra/osmo/internal/blockid"
 	"github.com/pandey-raghvendra/osmo/internal/triage"
 	"github.com/pandey-raghvendra/osmo/internal/tfplan"
 )
@@ -84,6 +86,7 @@ func (a actionKind) label() string {
 type uiModel struct {
 	dir      string
 	bin      string
+	rawPlan  []byte
 	drifts   []tfplan.Drift
 	verdicts []triage.Verdict
 	actions  []actionKind
@@ -103,7 +106,7 @@ type uiModel struct {
 	execErr  error
 }
 
-func newUIModel(dir, bin string, drifts []tfplan.Drift, verdicts []triage.Verdict) uiModel {
+func newUIModel(dir, bin string, rawPlan []byte, drifts []tfplan.Drift, verdicts []triage.Verdict) uiModel {
 	actions := make([]actionKind, len(verdicts))
 	for i, v := range verdicts {
 		if v.Severity == triage.Safe {
@@ -115,6 +118,7 @@ func newUIModel(dir, bin string, drifts []tfplan.Drift, verdicts []triage.Verdic
 	return uiModel{
 		dir:      dir,
 		bin:      bin,
+		rawPlan:  rawPlan,
 		drifts:   drifts,
 		verdicts: verdicts,
 		actions:  actions,
@@ -390,8 +394,9 @@ func renderTFValueShort(v tfplan.TFValue) string {
 	default:
 		b, _ := json.Marshal(gv)
 		s := string(b)
-		if len(s) > 60 {
-			s = s[:57] + "…"
+		if utf8.RuneCountInString(s) > 60 {
+			runes := []rune(s)
+			s = string(runes[:57]) + "…"
 		}
 		return s
 	}
@@ -484,7 +489,7 @@ Flags:`)
 	cfg := loadTriageConfig(*dir)
 	result := triage.Run(drifts, *dir, cfg)
 
-	m := newUIModel(*dir, *bin, drifts, result.Verdicts)
+	m := newUIModel(*dir, *bin, raw, drifts, result.Verdicts)
 
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	final, err := p.Run()
@@ -504,11 +509,18 @@ Flags:`)
 	fmt.Fprintln(os.Stderr, styleExecute.Render("running: ")+fm.execCmd)
 	fmt.Fprintln(os.Stderr)
 
-	// Execute osmo with the built flags inline.
+	// Execute osmo with the built flags, piping the cached plan JSON via stdin
+	// to avoid re-running terraform plan.
 	cmd := buildOsmoExec(*dir, *bin, fm)
+	cmd.Stdin = bytes.NewReader(fm.rawPlan)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if runErr := cmd.Run(); runErr != nil {
+		// osmo exits 2 when changes are absorbed — that is success, not error.
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) && exitErr.ExitCode() == exitChanges {
+			os.Exit(exitChanges)
+		}
 		os.Exit(exitError)
 	}
 	os.Exit(exitChanges)
@@ -519,7 +531,7 @@ func buildOsmoExec(dir, bin string, m uiModel) *exec.Cmd {
 	if self == "" {
 		self = "osmo"
 	}
-	cmdArgs := []string{"-dir", dir}
+	cmdArgs := []string{"-dir", dir, "-plan-json", "-"}
 	if bin != "" {
 		cmdArgs = append(cmdArgs, "-terraform", bin)
 	}
@@ -536,10 +548,5 @@ func buildOsmoExec(dir, bin string, m uiModel) *exec.Cmd {
 		}
 	}
 
-	// Reload the saved plan JSON to avoid re-running terraform.
-	// (The plan data is already in memory via the triage run; pass it via env.)
 	return exec.Command(self, cmdArgs...)
 }
-
-// blockid import used via loadTriageConfig — keep it used.
-var _ = blockid.LoadConfig

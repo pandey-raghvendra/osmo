@@ -11,6 +11,38 @@ Versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.5.0] - 2026-06-11
+
+### Fixed
+- **`absorb`: dynamic-block removal drift silently dropped** — `ResName` was
+  incorrectly set to `addr.Mode` instead of `addr.Name`, causing
+  `applyDynamicBlockUpdate` to never match the resource block when a nested
+  block type was entirely removed from reality. `ResMode` was also missing.
+- **`osmo ui`: exits 1 (error) on successful absorb** — child `osmo -write`
+  exits 2 when changes are absorbed (by design); the TUI now distinguishes
+  exit 2 (success-with-changes) from genuine errors.
+- **`osmo ui`: re-runs `terraform plan` in child process** — the TUI now pipes
+  the cached plan JSON to the child via `-plan-json -` so no second
+  `terraform plan` is needed; fixes TFC/CI workflows where a local plan is
+  unavailable.
+- **`-approve -json` silently ignored** — the combo is now rejected at startup
+  with a clear error; `-approve` is interactive and cannot produce JSON.
+- **`osmo triage` usage: broken pipe example** — documented
+  `osmo -json | osmo triage` which piped osmo's own JSON (not plan JSON);
+  corrected to `terraform show -json plan.tfplan | osmo triage -plan-json -`.
+- **TFC tarball missing local modules** — `buildTarball` previously included
+  only top-level `*.tf`/`*.tfvars` files; it now walks subdirectories
+  recursively (excluding `.terraform/`) so local module sources are included
+  in the speculative plan upload.
+- **TFC `waitForPlan` polls indefinitely** — added a 15-minute timeout so a
+  stuck or queued TFC run no longer hangs `osmo -verify` forever.
+
+### Changed
+- `osmo ui` now passes the pre-detected plan JSON to the child `osmo` process
+  via stdin (`-plan-json -`), eliminating a redundant `terraform plan` run.
+
+---
+
 ## [1.4.0] - 2026-06-02
 
 ### Added

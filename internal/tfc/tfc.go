@@ -287,14 +287,17 @@ func (b *Backend) createRun(ctx context.Context, wsID, cvID string) (string, err
 }
 
 // waitForPlan polls the run until it reaches a terminal plan state and returns
-// the plan ID.
+// the plan ID. Gives up after 15 minutes to prevent infinite blocking on stuck runs.
 func (b *Backend) waitForPlan(ctx context.Context, runID string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", fmt.Errorf("timed out waiting for TFC run %s: %w", runID, ctx.Err())
 		case <-ticker.C:
 			raw, err := b.do(ctx, http.MethodGet, "/runs/"+runID, nil, "")
 			if err != nil {
@@ -371,41 +374,60 @@ func isActionable(actions []string) bool {
 
 // --- tarball builder ---------------------------------------------------------
 
-// buildTarball creates a gzip'd tar archive of all .tf and .tfvars files in dir.
-// TFC expects a flat tarball (files at root, no top-level directory wrapper).
+// buildTarball creates a gzip'd tar archive of .tf, .tfvars, .tfvars.json, and
+// .terraform.lock.hcl files under dir, including local module subdirectories.
+// Paths inside the tarball are relative to dir so TFC can unpack them directly.
+// The .terraform directory is excluded (provider binaries, state files).
 func buildTarball(dir string) ([]byte, error) {
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 
-	patterns := []string{"*.tf", "*.tfvars", "*.tfvars.json"}
-	for _, pat := range patterns {
-		matches, err := filepath.Glob(filepath.Join(dir, pat))
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve dir: %w", err)
+	}
+
+	err = filepath.Walk(absDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
-			return nil, err
+			return err
 		}
-		for _, p := range matches {
-			info, err := os.Stat(p)
-			if err != nil {
-				return nil, err
+		if info.IsDir() {
+			// Skip the .terraform directory (provider binaries, cached modules).
+			if info.Name() == ".terraform" {
+				return filepath.SkipDir
 			}
-			content, err := os.ReadFile(p)
-			if err != nil {
-				return nil, err
-			}
-			hdr := &tar.Header{
-				Name:    filepath.Base(p),
-				Mode:    0o644,
-				Size:    info.Size(),
-				ModTime: info.ModTime(),
-			}
-			if err := tw.WriteHeader(hdr); err != nil {
-				return nil, err
-			}
-			if _, err := tw.Write(content); err != nil {
-				return nil, err
-			}
+			return nil
 		}
+		name := info.Name()
+		if !strings.HasSuffix(name, ".tf") &&
+			!strings.HasSuffix(name, ".tfvars") &&
+			!strings.HasSuffix(name, ".tfvars.json") &&
+			name != ".terraform.lock.hcl" {
+			return nil
+		}
+		rel, relErr := filepath.Rel(absDir, path)
+		if relErr != nil {
+			return relErr
+		}
+		content, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		hdr := &tar.Header{
+			Name:    rel,
+			Mode:    0o644,
+			Size:    int64(len(content)),
+			ModTime: info.ModTime(),
+		}
+		if writeErr := tw.WriteHeader(hdr); writeErr != nil {
+			return writeErr
+		}
+		_, writeErr := tw.Write(content)
+		return writeErr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("walk workspace: %w", err)
 	}
 
 	if err := tw.Close(); err != nil {
@@ -421,5 +443,3 @@ func buildTarball(dir string) ([]byte, error) {
 func (b *Backend) WorkspaceURL() string {
 	return fmt.Sprintf("https://%s/app/%s/workspaces/%s", b.Host, b.Organization, b.Workspace)
 }
-
-

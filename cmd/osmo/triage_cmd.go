@@ -46,9 +46,9 @@ Flags:`)
 		fs.PrintDefaults()
 		fmt.Fprintln(os.Stderr, `
 Examples:
-  osmo triage -dir ./infra                  # detect and triage
-  osmo -dir ./infra -json | osmo triage     # pipe from osmo -json
-  osmo triage -plan-json plan.json          # pre-generated plan`)
+  osmo triage -dir ./infra                                   # detect and triage
+  terraform show -json plan.tfplan | osmo triage -plan-json -  # pipe raw plan JSON
+  osmo triage -plan-json plan.json                           # pre-generated plan`)
 	}
 	_ = fs.Parse(args)
 

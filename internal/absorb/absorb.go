@@ -1053,7 +1053,8 @@ func walkDriftMap(
 		dynUpdates = append(dynUpdates, DynamicBlockUpdate{
 			DriftAddr: driftAddr,
 			ResType:   addr.Type,
-			ResName:   addr.Mode,
+			ResName:   addr.Name,
+			ResMode:   addr.Mode,
 			Steps:     path,
 			BlockType: k,
 			AfterFull: nil,
