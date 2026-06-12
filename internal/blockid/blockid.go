@@ -52,11 +52,20 @@ type TriageConfig struct {
 	SafeAttrs     []string `json:"safe_attrs"`      // additional attr name patterns → Safe
 }
 
+// InspectConfig holds per-project normals for osmo inspect.
+// Keys follow the format "resource_type.block_type.attr".
+// Values are lists of equivalent/normal values for that attribute — changes
+// between these values are classified as provider noise.
+type InspectConfig struct {
+	Normals map[string][]interface{} `json:"normals"`
+}
+
 // Config is the full contents of .osmo.json.
 type Config struct {
 	BlockIdentity map[string][]string `json:"block_identity"`
 	Defaults      Defaults            `json:"defaults"`
 	Triage        TriageConfig        `json:"triage"`
+	Inspect       InspectConfig       `json:"inspect"`
 }
 
 // Registry is an immutable lookup of identity keys per resource+block type.
@@ -137,7 +146,7 @@ func (c *Config) registry() *Registry {
 // Keys returns the identity key names for the given resource type and nesting
 // path, or nil if no entry is registered (caller falls back to scoring).
 func (r *Registry) Keys(resourceType string, path []string) []string {
-	if len(path) == 0 {
+	if r == nil || len(path) == 0 {
 		return nil
 	}
 	key := resourceType + "." + path[len(path)-1]

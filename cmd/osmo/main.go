@@ -63,6 +63,9 @@ func main() {
 		case "ui":
 			uiCmd(os.Args[2:])
 			return
+		case "inspect":
+			inspectCmd(os.Args[2:])
+			return
 		}
 	}
 

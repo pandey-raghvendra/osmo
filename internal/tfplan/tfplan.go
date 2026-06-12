@@ -100,6 +100,32 @@ func ParseDrift(raw []byte) ([]Drift, error) {
 	return drifts, nil
 }
 
+// PlanJSON runs a normal (config-driven) terraform plan in dir and returns the
+// raw terraform show -json output for use with osmo inspect.
+func PlanJSON(ctx context.Context, dir, terraformBin string) ([]byte, error) {
+	if terraformBin == "" {
+		terraformBin = "terraform"
+	}
+	planFile, err := os.CreateTemp(dir, "inspect-*.tfplan")
+	if err != nil {
+		return nil, fmt.Errorf("create temp plan file: %w", err)
+	}
+	planPath := planFile.Name()
+	planFile.Close()
+	defer os.Remove(planPath)
+
+	if err := run(ctx, dir, terraformBin,
+		"plan", "-input=false", "-no-color",
+		"-out="+filepath.Base(planPath)); err != nil {
+		return nil, fmt.Errorf("terraform plan: %w", err)
+	}
+	raw, err := output(ctx, dir, terraformBin, "show", "-json", filepath.Base(planPath))
+	if err != nil {
+		return nil, fmt.Errorf("terraform show -json: %w", err)
+	}
+	return raw, nil
+}
+
 // PlannedChanges runs a normal (config-driven) plan in dir and returns the
 // addresses Terraform would still act on, i.e. resources whose actions are not
 // purely "no-op"/"read". After osmo absorbs drift into config, a converged
